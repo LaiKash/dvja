@@ -1,0 +1,608 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/dvja
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  # ──────────────────────────────────────────────
+  # JOB 1: Build the Maven application
+  # ──────────────────────────────────────────────
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build with Maven (skip tests for speed)
+        run: mvn clean package -DskipTests --batch-mode
+
+      - name: Upload WAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dvja-war
+          path: target/*.war
+
+  # ──────────────────────────────────────────────
+  # JOB 2: Secrets Detection (Gitleaks)
+  # ──────────────────────────────────────────────
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    needs: build
+    continue-on-error: true   # monitoring mode – never blocks pipeline
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # full history needed for accurate scan
+
+      - name: Run Gitleaks
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # optional for public repos
+        continue-on-error: true
+
+      - name: Upload Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+
+  # ──────────────────────────────────────────────
+  # JOB 3: SAST – CodeQL
+  # ──────────────────────────────────────────────
+  codeql-sast:
+    name: SAST – CodeQL
+    runs-on: ubuntu-latest
+    needs: build
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+          queries: security-and-quality
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Build for CodeQL
+        run: mvn clean package -DskipTests --batch-mode
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:java"
+          output: codeql-results
+          upload: always
+
+      - name: Upload CodeQL SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif
+          path: codeql-results/
+          if-no-files-found: ignore
+
+  # ──────────────────────────────────────────────
+  # JOB 4: SCA – Trivy dependency scan
+  # ──────────────────────────────────────────────
+  trivy-sca:
+    name: SCA – Trivy Dependencies
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Run Trivy on filesystem (SCA)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-sca-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'          # non-blocking
+
+      - name: Also produce SARIF for GitHub Security tab
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-sca.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy SCA SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-sca.sarif
+          category: trivy-sca
+        continue-on-error: true
+
+      - name: Upload Trivy SCA JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sca-results
+          path: trivy-sca-results.json
+
+  # ──────────────────────────────────────────────
+  # JOB 5: Build & Push Docker image
+  # ──────────────────────────────────────────────
+  docker-build-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      image_ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dvja-war
+          path: target/
+
+      - name: Remove target from .dockerignore
+        run: sed -i '/^target/d' .dockerignore
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=${{ github.sha }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────
+  # JOB 6: Container Security – Trivy image scan
+  # ──────────────────────────────────────────────
+  trivy-container:
+    name: Container Security – Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Run Trivy container scan (JSON)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          vuln-type: 'os'
+          format: 'json'
+          output: 'trivy-image-results.json'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Run Trivy container scan (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
+          vuln-type: 'os'
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload container SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-container
+        continue-on-error: true
+
+      - name: Upload container scan JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-results
+          path: trivy-image-results.json
+
+  # ──────────────────────────────────────────────
+  # JOB 7: Create GitHub Issues for HIGH/CRITICAL
+  #   - Groups by package (DEPENDENCY/CONTAINER)
+  #     or by rule (CODE) or as single (SECRET)
+  #   - Deduplicates against existing open issues
+  #   - Capped at 50 issues per run to prevent flooding
+  # ──────────────────────────────────────────────
+  create-security-issues:
+    name: Create Security Issues
+    runs-on: ubuntu-latest
+    needs: [ secrets-scan, codeql-sast, trivy-sca, trivy-container ]
+    if: always()
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download SCA results
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-sca-results
+          path: ./reports
+        continue-on-error: true
+
+      - name: Download container scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-image-results
+          path: ./reports
+        continue-on-error: true
+
+      - name: Download CodeQL SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: codeql-sarif
+          path: ./reports/codeql
+        continue-on-error: true
+
+      - name: Download Gitleaks report
+        uses: actions/download-artifact@v4
+        with:
+          name: gitleaks-report
+          path: ./reports/gitleaks
+        continue-on-error: true
+
+      - name: Create categorized security issues
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const MAX_ISSUES_PER_RUN = 50;
+            const SEV_EMOJI = { CRITICAL: '🔴', HIGH: '🟠' };
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().split('T')[0];
+
+            // ── Ensure required labels exist ──
+            const labelDefs = [
+              { name: 'security',   color: 'e11d48', description: 'Security finding' },
+              { name: 'critical',   color: 'b91c1c', description: 'Critical severity' },
+              { name: 'high',       color: 'f97316', description: 'High severity' },
+              { name: 'dependency', color: '8b5cf6', description: 'Vulnerable dependency (SCA)' },
+              { name: 'container',  color: '0ea5e9', description: 'Container image vulnerability' },
+              { name: 'code',       color: '10b981', description: 'Source code vulnerability (SAST)' },
+              { name: 'secret',     color: 'ef4444', description: 'Exposed secret or credential' }
+            ];
+            const existingLabels = await github.rest.issues.listLabelsForRepo({
+              owner, repo, per_page: 100
+            });
+            const labelNames = new Set(existingLabels.data.map(l => l.name));
+            for (const ld of labelDefs) {
+              if (!labelNames.has(ld.name)) {
+                await github.rest.issues.createLabel({ owner, repo, ...ld }).catch(() => {});
+              }
+            }
+
+            // ── Fetch ALL open security issues for dedup (paginated) ──
+            const allOpen = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: 'security', per_page: 100
+            });
+            const existingTitles = new Set(allOpen.map(i => i.title));
+
+            const issues = [];
+            const footer = `\n---\n*DevSecOps pipeline — ${today} | [Run #${context.runId}](${runUrl})*`;
+
+            // ────────────────────────────────────
+            //  1. TRIVY SCA → [DEPENDENCY] issues
+            // ────────────────────────────────────
+            const scaPath = './reports/trivy-sca-results.json';
+            if (fs.existsSync(scaPath)) {
+              try {
+                const report = JSON.parse(fs.readFileSync(scaPath, 'utf8'));
+                const pkgs = new Map();
+                for (const res of (report.Results || [])) {
+                  for (const v of (res.Vulnerabilities || [])) {
+                    if (!['CRITICAL','HIGH'].includes(v.Severity)) continue;
+                    if (!pkgs.has(v.PkgName)) pkgs.set(v.PkgName, { vulns: [], max: 'HIGH' });
+                    const e = pkgs.get(v.PkgName);
+                    e.vulns.push(v);
+                    if (v.Severity === 'CRITICAL') e.max = 'CRITICAL';
+                  }
+                }
+                for (const [pkg, { vulns, max }] of pkgs) {
+                  const n = vulns.length;
+                  const title = `[${max}][DEPENDENCY] ${pkg} — ${n} vulnerabilit${n === 1 ? 'y' : 'ies'}`;
+                  const installed = vulns[0].InstalledVersion || 'N/A';
+                  const fixes = [...new Set(vulns.filter(v => v.FixedVersion).map(v => v.FixedVersion))];
+                  const rows = vulns.map(v =>
+                    `| ${SEV_EMOJI[v.Severity]} ${v.Severity} | [${v.VulnerabilityID}](https://nvd.nist.gov/vuln/detail/${v.VulnerabilityID}) | \`${v.FixedVersion || 'N/A'}\` | ${(v.Description||'').slice(0,80)}${(v.Description||'').length>80?'…':''} |`
+                  ).join('\n');
+                  const body = [
+                    `## ${SEV_EMOJI[max]} Vulnerable Dependency: \`${pkg}\``,
+                    '', '| Field | Value |', '|-------|-------|',
+                    `| **Package** | \`${pkg}\` |`,
+                    `| **Installed** | \`${installed}\` |`,
+                    `| **Fix available** | ${fixes.length ? `\`${fixes.join('`, `')}\`` : 'No fix available'} |`,
+                    `| **Detected by** | Trivy SCA |`,
+                    '', `### Vulnerabilities (${n})`, '',
+                    '| Severity | CVE | Fixed In | Description |',
+                    '|----------|-----|----------|-------------|',
+                    rows, '',
+                    '### Remediation',
+                    fixes.length
+                      ? `Update \`${pkg}\` to version **${fixes[fixes.length-1]}** or later in \`pom.xml\`.`
+                      : 'No upstream fix available. Consider replacing or isolating this dependency.',
+                    footer
+                  ].join('\n');
+                  issues.push({ title, body, labels: ['security', max.toLowerCase(), 'dependency'], severity: max });
+                }
+              } catch (e) { console.log(`SCA parse error: ${e.message}`); }
+            } else { console.log('No SCA results found'); }
+
+            // ────────────────────────────────────
+            //  2. TRIVY IMAGE → [CONTAINER] issues
+            // ────────────────────────────────────
+            const imgPath = './reports/trivy-image-results.json';
+            if (fs.existsSync(imgPath)) {
+              try {
+                const report = JSON.parse(fs.readFileSync(imgPath, 'utf8'));
+                const pkgs = new Map();
+                for (const res of (report.Results || [])) {
+                  for (const v of (res.Vulnerabilities || [])) {
+                    if (!['CRITICAL','HIGH'].includes(v.Severity)) continue;
+                    if (!pkgs.has(v.PkgName)) pkgs.set(v.PkgName, { vulns: [], max: 'HIGH' });
+                    const e = pkgs.get(v.PkgName);
+                    e.vulns.push(v);
+                    if (v.Severity === 'CRITICAL') e.max = 'CRITICAL';
+                  }
+                }
+                for (const [pkg, { vulns, max }] of pkgs) {
+                  const n = vulns.length;
+                  const title = `[${max}][CONTAINER] ${pkg} — ${n} vulnerabilit${n === 1 ? 'y' : 'ies'}`;
+                  const installed = vulns[0].InstalledVersion || 'N/A';
+                  const fixes = [...new Set(vulns.filter(v => v.FixedVersion).map(v => v.FixedVersion))];
+                  const rows = vulns.map(v =>
+                    `| ${SEV_EMOJI[v.Severity]} ${v.Severity} | [${v.VulnerabilityID}](https://nvd.nist.gov/vuln/detail/${v.VulnerabilityID}) | \`${v.FixedVersion || 'N/A'}\` | ${(v.Description||'').slice(0,80)}${(v.Description||'').length>80?'…':''} |`
+                  ).join('\n');
+                  const body = [
+                    `## ${SEV_EMOJI[max]} Container Vulnerability: \`${pkg}\``,
+                    '', '| Field | Value |', '|-------|-------|',
+                    `| **OS Package** | \`${pkg}\` |`,
+                    `| **Installed** | \`${installed}\` |`,
+                    `| **Fix available** | ${fixes.length ? `\`${fixes.join('`, `')}\`` : 'No fix available'} |`,
+                    `| **Detected by** | Trivy image scan |`,
+                    '', `### Vulnerabilities (${n})`, '',
+                    '| Severity | CVE | Fixed In | Description |',
+                    '|----------|-----|----------|-------------|',
+                    rows, '',
+                    '### Remediation',
+                    fixes.length
+                      ? `Update the base image or pin \`${pkg}\` to **${fixes[fixes.length-1]}** or later.`
+                      : 'No upstream fix. Consider a different base image (e.g. Alpine or distroless).',
+                    footer
+                  ].join('\n');
+                  issues.push({ title, body, labels: ['security', max.toLowerCase(), 'container'], severity: max });
+                }
+              } catch (e) { console.log(`Container parse error: ${e.message}`); }
+            } else { console.log('No container results found'); }
+
+            // ────────────────────────────────────
+            //  3. CODEQL SARIF → [CODE] issues
+            // ────────────────────────────────────
+            const codeqlDir = './reports/codeql';
+            if (fs.existsSync(codeqlDir)) {
+              try {
+                const files = fs.readdirSync(codeqlDir).filter(f => f.endsWith('.sarif'));
+                for (const sf of files) {
+                  const sarif = JSON.parse(fs.readFileSync(path.join(codeqlDir, sf), 'utf8'));
+                  const ruleMap = new Map();
+
+                  for (const run of (sarif.runs || [])) {
+                    const ruleDefs = {};
+                    for (const r of (run.tool?.driver?.rules || [])) ruleDefs[r.id] = r;
+
+                    for (const result of (run.results || [])) {
+                      const rid = result.ruleId || 'unknown';
+                      const rule = ruleDefs[rid] || {};
+                      const secSev = parseFloat(rule.properties?.['security-severity'] || '0');
+                      let severity;
+                      if (secSev >= 9.0) severity = 'CRITICAL';
+                      else if (secSev >= 7.0 || result.level === 'error') severity = 'HIGH';
+                      else continue;
+
+                      if (!ruleMap.has(rid)) {
+                        ruleMap.set(rid, {
+                          rule, severity,
+                          desc: rule.shortDescription?.text || rid,
+                          locs: []
+                        });
+                      }
+                      const entry = ruleMap.get(rid);
+                      if (severity === 'CRITICAL') entry.severity = 'CRITICAL';
+                      const loc = result.locations?.[0]?.physicalLocation;
+                      entry.locs.push({
+                        file: loc?.artifactLocation?.uri || 'unknown',
+                        line: loc?.region?.startLine || '?',
+                        msg: result.message?.text || ''
+                      });
+                    }
+                  }
+
+                  for (const [rid, { rule, severity, desc, locs }] of ruleMap) {
+                    const n = locs.length;
+                    const title = `[${severity}][CODE] ${desc} — ${n} location${n===1?'':'s'}`;
+                    const cweTag = (rule.properties?.tags||[]).find(t => t.startsWith('external/cwe/'));
+                    const cwe = cweTag ? cweTag.replace('external/cwe/', '').toUpperCase() : null;
+                    const locRows = locs.map(l =>
+                      `| \`${l.file}\` | ${l.line} | ${l.msg.slice(0,100)}${l.msg.length>100?'…':''} |`
+                    ).join('\n');
+
+                    const body = [
+                      `## ${SEV_EMOJI[severity]} Code Vulnerability: ${desc}`,
+                      '', '| Field | Value |', '|-------|-------|',
+                      `| **Rule** | \`${rid}\` |`,
+                      cwe ? `| **CWE** | [${cwe}](https://cwe.mitre.org/data/definitions/${cwe.replace('CWE-','')}.html) |` : null,
+                      `| **Locations** | ${n} |`,
+                      `| **Detected by** | CodeQL SAST |`,
+                      '', '### Affected Locations', '',
+                      '| File | Line | Finding |',
+                      '|------|------|---------|',
+                      locRows, '',
+                      '### Remediation',
+                      rule.help?.text || `Review and fix the ${desc.toLowerCase()} pattern in the affected files.`,
+                      footer
+                    ].filter(Boolean).join('\n');
+                    issues.push({ title, body, labels: ['security', severity.toLowerCase(), 'code'], severity });
+                  }
+                }
+              } catch (e) { console.log(`CodeQL parse error: ${e.message}`); }
+            } else { console.log('No CodeQL SARIF found'); }
+
+            // ────────────────────────────────────
+            //  4. GITLEAKS SARIF → [SECRET] issue
+            // ────────────────────────────────────
+            const glDir = './reports/gitleaks';
+            if (fs.existsSync(glDir)) {
+              try {
+                const files = fs.readdirSync(glDir).filter(f => f.endsWith('.sarif'));
+                const secrets = [];
+                for (const sf of files) {
+                  const sarif = JSON.parse(fs.readFileSync(path.join(glDir, sf), 'utf8'));
+                  for (const run of (sarif.runs || [])) {
+                    for (const result of (run.results || [])) {
+                      const loc = result.locations?.[0]?.physicalLocation;
+                      secrets.push({
+                        type: result.ruleId || 'unknown',
+                        file: loc?.artifactLocation?.uri || 'unknown',
+                        line: loc?.region?.startLine || '?'
+                      });
+                    }
+                  }
+                }
+                if (secrets.length > 0) {
+                  const title = `[CRITICAL][SECRET] ${secrets.length} exposed secret${secrets.length===1?'':'s'} detected`;
+                  const rows = secrets.map(s => `| \`${s.type}\` | \`${s.file}\` | ${s.line} |`).join('\n');
+                  const body = [
+                    '## 🔴 Exposed Secrets Detected', '',
+                    `Gitleaks found **${secrets.length}** potential secret(s) in the repository.`,
+                    '', '### Findings', '',
+                    '| Secret Type | File | Line |',
+                    '|-------------|------|------|',
+                    rows, '',
+                    '### Remediation',
+                    '1. **Rotate** all exposed credentials immediately',
+                    '2. **Remove** secrets from the codebase and git history',
+                    '3. **Use** environment variables or a secrets manager instead',
+                    '4. Add false positives to `.gitleaks.toml` allowlist',
+                    footer
+                  ].join('\n');
+                  issues.push({ title, body, labels: ['security', 'critical', 'secret'], severity: 'CRITICAL' });
+                }
+              } catch (e) { console.log(`Gitleaks parse error: ${e.message}`); }
+            } else { console.log('No Gitleaks report found'); }
+
+            // ── Sort CRITICAL first, then HIGH ──
+            issues.sort((a, b) => (a.severity === b.severity) ? 0 : a.severity === 'CRITICAL' ? -1 : 1);
+
+            // ── Create issues with dedup + cap ──
+            let created = 0, skipped = 0, capped = 0;
+            for (const issue of issues) {
+              if (existingTitles.has(issue.title)) { skipped++; continue; }
+              if (created >= MAX_ISSUES_PER_RUN) { capped++; continue; }
+              try {
+                await github.rest.issues.create({
+                  owner, repo,
+                  title: issue.title,
+                  body: issue.body,
+                  labels: issue.labels
+                });
+                existingTitles.add(issue.title);
+                created++;
+                console.log(`✅ ${issue.title}`);
+                await new Promise(r => setTimeout(r, 1000));
+              } catch (err) {
+                if (err.status === 403) {
+                  console.log('Rate limited — stopping issue creation.');
+                  break;
+                }
+                console.log(`❌ ${issue.title}: ${err.message}`);
+              }
+            }
+
+            console.log(`\n── Summary ──`);
+            console.log(`Created: ${created} | Skipped (existing): ${skipped} | Capped: ${capped}`);
+            console.log(`Total findings across all scanners: ${issues.length}`);
+            if (capped > 0) console.log(`⚠️ ${capped} issues deferred — will be created in subsequent runs.`);
