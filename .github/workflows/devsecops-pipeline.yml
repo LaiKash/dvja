@@ -325,7 +325,7 @@ jobs:
       - name: Create categorized security issues
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -457,7 +457,7 @@ jobs:
                   issues.push({ title, body, labels: ['security', max.toLowerCase(), 'container'], severity: max });
                 }
               } catch (e) { console.log(`Container parse error: ${e.message}`); }
-            } else { console.log('No container results found'); }
+            } else { console.log('No container results file found at ' + imgPath); }
 
             // ────────────────────────────────────
             //  3. CODEQL SARIF → [CODE] issues
@@ -466,6 +466,7 @@ jobs:
             if (fs.existsSync(codeqlDir)) {
               try {
                 const files = fs.readdirSync(codeqlDir).filter(f => f.endsWith('.sarif'));
+                console.log(`CodeQL: found ${files.length} SARIF file(s) in ${codeqlDir}: ${files.join(', ') || '(none)'}`);
                 for (const sf of files) {
                   const sarif = JSON.parse(fs.readFileSync(path.join(codeqlDir, sf), 'utf8'));
                   const ruleMap = new Map();
@@ -473,6 +474,12 @@ jobs:
                   for (const run of (sarif.runs || [])) {
                     const ruleDefs = {};
                     for (const r of (run.tool?.driver?.rules || [])) ruleDefs[r.id] = r;
+                    for (const ext of (run.tool?.extensions || [])) {
+                      for (const r of (ext.rules || [])) ruleDefs[r.id] = r;
+                    }
+
+                    const totalResults = (run.results || []).length;
+                    console.log(`CodeQL: run has ${Object.keys(ruleDefs).length} rule defs, ${totalResults} results`);
 
                     for (const result of (run.results || [])) {
                       const rid = result.ruleId || 'unknown';
@@ -501,6 +508,7 @@ jobs:
                     }
                   }
 
+                  console.log(`CodeQL: ${ruleMap.size} rules qualified as HIGH/CRITICAL`);
                   for (const [rid, { rule, severity, desc, locs }] of ruleMap) {
                     const n = locs.length;
                     const title = `[${severity}][CODE] ${desc} — ${n} location${n===1?'':'s'}`;
@@ -529,7 +537,7 @@ jobs:
                   }
                 }
               } catch (e) { console.log(`CodeQL parse error: ${e.message}`); }
-            } else { console.log('No CodeQL SARIF found'); }
+            } else { console.log('No CodeQL SARIF directory found'); }
 
             // ────────────────────────────────────
             //  4. GITLEAKS SARIF → [SECRET] issue
@@ -537,7 +545,9 @@ jobs:
             const glDir = './reports/gitleaks';
             if (fs.existsSync(glDir)) {
               try {
-                const files = fs.readdirSync(glDir).filter(f => f.endsWith('.sarif'));
+                const allGlFiles = fs.readdirSync(glDir);
+                console.log(`Gitleaks: directory contains: ${allGlFiles.join(', ') || '(empty)'}`);
+                const files = allGlFiles.filter(f => f.endsWith('.sarif'));
                 const secrets = [];
                 for (const sf of files) {
                   const sarif = JSON.parse(fs.readFileSync(path.join(glDir, sf), 'utf8'));
@@ -572,7 +582,7 @@ jobs:
                   issues.push({ title, body, labels: ['security', 'critical', 'secret'], severity: 'CRITICAL' });
                 }
               } catch (e) { console.log(`Gitleaks parse error: ${e.message}`); }
-            } else { console.log('No Gitleaks report found'); }
+            } else { console.log('No Gitleaks report directory found at ' + glDir); }
 
             // ── Sort CRITICAL first, then HIGH ──
             issues.sort((a, b) => (a.severity === b.severity) ? 0 : a.severity === 'CRITICAL' ? -1 : 1);
@@ -594,11 +604,15 @@ jobs:
                 console.log(`✅ ${issue.title}`);
                 await new Promise(r => setTimeout(r, 1000));
               } catch (err) {
-                if (err.status === 403) {
+                console.log(`❌ ${issue.title}: ${err.status} ${err.message}`);
+                if (err.status === 403 && err.message.includes('rate limit')) {
                   console.log('Rate limited — stopping issue creation.');
                   break;
                 }
-                console.log(`❌ ${issue.title}: ${err.message}`);
+                if (err.status === 403 || err.status === 401) {
+                  console.log('⚠️ Auth/permission error — check GITHUB_TOKEN permissions and repo Settings > Actions > Workflow permissions.');
+                  break;
+                }
               }
             }
 
