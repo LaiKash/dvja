@@ -1,5 +1,5 @@
-FROM openjdk:8
-MAINTAINER Abhisek Datta <abhisek@appsecco.com>
+FROM eclipse-temurin:8-jdk
+LABEL maintainer="Abhisek Datta <abhisek@appsecco.com>"
 
 RUN apt-get update
 RUN apt-get install -y default-mysql-client
