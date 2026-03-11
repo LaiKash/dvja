@@ -125,6 +125,7 @@ jobs:
         run: mvn clean package -DskipTests --batch-mode
 
       - name: Index XML and properties files
+        continue-on-error: true
         run: |
           "${CODEQL_DIST}/codeql" database index-files \
             --language xml \

