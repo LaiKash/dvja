@@ -326,7 +326,7 @@ CVE-2016-1000027 relates to unsafe deserialization in Spring's `HttpInvokerServi
 
 ## 5. Container Scan Findings — Trivy Image
 
-After fixing the Trivy container scan to include library-level vulnerabilities (`vuln-type: 'os,library'`), the scan detected vulnerable packages inside the Docker image. The pipeline deduplicates results: libraries already reported by SCA (via `pom.xml`) are **not** re-reported as container issues. Only packages found **exclusively in the Docker image** (transitive/build dependencies not declared in `pom.xml`) produce `[CONTAINER]` issues.
+After fixing the Trivy container scan to include library-level vulnerabilities (`vuln-type: 'os,library'`), the scan detected vulnerable packages inside the Docker image. The pipeline deduplicates results: libraries already reported by SCA (via `pom.xml`) are **not** re-reported as container issues. Only packages found **exclusively in the Docker image** (not declared in `pom.xml`) produce `[CONTAINER]` issues.
 
 ### 5.1 Why Container Scan Matters (Defense in Depth)
 
@@ -336,27 +336,85 @@ The SCA scan (Trivy fs) analyzes `pom.xml` — what the build *declares*. The co
 - OS-level packages from the base image (e.g., Ubuntu libraries)
 - Version discrepancies between declared and actual deployed versions
 
-### 5.2 Container-Only Findings (5 packages not in SCA)
+### 5.2 Container-Only Findings — Build Tooling, Not Runtime
 
-These packages were found **only** in the Docker image — they are transitive or build-time dependencies not directly declared in `pom.xml`:
+The container scan found 5 packages not present in the SCA results. Upon investigation, **all 5 are Maven build tools**, not application runtime dependencies:
 
-| Package | Version | Unique CVEs | Verdict | Key CVEs |
-|---------|---------|-------------|---------|----------|
-| com.thoughtworks.xstream:xstream | 1.4.10 | ~8 | TRUE POSITIVE | CVE-2021-39144 (8.5), CVE-2021-21344 (9.8) — deserialization RCE chain |
-| org.codehaus.plexus:plexus-utils | 3.0.15 | ~5 | TRUE POSITIVE | CVE-2022-4244 (9.1) — path traversal in build tooling |
-| org.codehaus.plexus:plexus-archiver | 2.1 | ~1 | TRUE POSITIVE | Archive extraction path traversal (build tooling) |
-| org.apache.maven:maven-core | 3.0.4 | ~1 | TRUE POSITIVE | Build tooling CVEs |
-| org.apache.maven.shared:maven-shared-utils | 0.1 | 1 | TRUE POSITIVE | CVE-2022-29599 (9.8) — command injection in build utils |
+| Package | Version | Unique CVEs | Where It Lives | In WAR? | Risk Level |
+|---------|---------|-------------|----------------|---------|------------|
+| com.thoughtworks.xstream:xstream | 1.4.10 | ~8 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
+| org.codehaus.plexus:plexus-utils | 3.0.15 | ~2 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
+| org.codehaus.plexus:plexus-archiver | 2.1 | ~1 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
+| org.apache.maven:maven-core | 3.0.4 | ~1 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
+| org.apache.maven.shared:maven-shared-utils | 0.1 | 1 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
 
-**Notable finding:** XStream 1.4.10 was not reported by the SCA scan because it enters the WAR as a transitive dependency (pulled by Struts2 internally), not declared directly in `pom.xml`. This demonstrates the value of container scanning as a second layer of defense.
+**How we verified this:** We ran `mvn dependency:tree` and confirmed that none of these packages appear in the application's dependency tree. They are not bundled in the WAR file (`WEB-INF/lib/`), which means the running Java application never loads them.
 
-### 5.3 Deduplication and CVE Inflation — Lessons Learned
+**Root cause — single-stage Dockerfile:** The DVJA Dockerfile installs Maven via `apt-get install -y maven` to build the app, but because it uses a **single-stage build**, Maven and all its libraries remain in the final production image:
+
+```dockerfile
+FROM eclipse-temurin:8-jdk          # Base image
+RUN apt-get install -y maven        # Maven + all its JARs installed here
+WORKDIR /app
+COPY . .
+RUN mvn clean package               # Build the WAR
+CMD ["sh", "-c", "/app/scripts/start.sh"]  # Run the app
+# Problem: Maven JARs are still in the image!
+```
+
+This is a common anti-pattern in Docker. The build tools are only needed during `mvn clean package`, but they persist in every layer of the final image.
+
+### 5.3 Are These False Positives?
+
+**Strictly speaking, no** — the vulnerable JARs genuinely exist inside the Docker image, and the CVEs are real. Trivy correctly reports them. However, they are **not exploitable through the application** because:
+
+1. They are not on the Java application's classpath (not in the WAR)
+2. The application code never imports or calls any of these libraries
+3. An attacker would need to already have shell access to the container to interact with these files
+
+In practice, these are **"build artifact noise"** — findings caused by poor container hygiene rather than application-level vulnerabilities. They represent an **unnecessary attack surface expansion**: if an attacker gains Remote Code Execution through a real vulnerability (e.g., Struts2 CVE-2017-5638), these extra tools in the image could potentially be leveraged for further exploitation.
+
+### 5.4 Recommended Fix — Multi-Stage Dockerfile
+
+The proper solution is a **multi-stage Docker build**. This separates the build environment from the runtime environment, so Maven and its libraries never appear in the production image:
+
+```dockerfile
+# ── Stage 1: Build ──
+FROM eclipse-temurin:8-jdk AS builder
+RUN apt-get update && apt-get install -y maven
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:resolve
+COPY . .
+RUN mvn clean package -DskipTests
+
+# ── Stage 2: Runtime (no Maven, no build tools) ──
+FROM eclipse-temurin:8-jre
+RUN apt-get update && apt-get install -y default-mysql-client && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /app/target/dvja-1.0-SNAPSHOT.war ./target/dvja-1.0-SNAPSHOT.war
+COPY --from=builder /app/scripts/start.sh ./scripts/start.sh
+RUN chmod 755 /app/scripts/start.sh
+EXPOSE 8080
+CMD ["sh", "-c", "/app/scripts/start.sh"]
+```
+
+**What this achieves:**
+- The `builder` stage has Maven, JDK, and everything needed to compile — but it's **discarded** after the build
+- The `runtime` stage starts fresh from `eclipse-temurin:8-jre` (smaller — JRE only, no JDK compiler)
+- Only the WAR file and startup script are copied into the final image
+- Maven, XStream, Plexus, and all other build tools are **eliminated** from the production image
+- The final image is significantly smaller (hundreds of MB less)
+
+This would reduce the 5 container-only issues to **zero** and is considered a Docker best practice for production deployments.
+
+### 5.5 Deduplication and CVE Inflation — Lessons Learned
 
 During initial pipeline runs, the container scan produced **inflated issue counts** for two reasons:
 
 1. **Cross-scanner duplication**: The same library (e.g., `log4j-core 2.3`) was reported by both SCA (issue #5: 4 CVEs) and Container (issue #30: 12 CVEs), creating two issues for the same vulnerability.
 
-2. **Within-container triplication**: Trivy found each JAR at **3 paths** inside the image (Maven local cache, exploded WAR, packaged WAR), reporting each CVE once per path. Example: `struts2-core` has 17 unique CVEs × 3 paths = 51 listed entries.
+2. **Within-container triplication**: Trivy found each JAR at **3 paths** inside the image (Maven local cache `~/.m2`, exploded WAR `target/dvja/WEB-INF/lib/`, and packaged WAR `target/dvja.war`), reporting each CVE once per path. Example: `struts2-core` has 17 unique CVEs × 3 paths = 51 listed entries.
 
 **Fixes applied to the pipeline:**
 - Container issues are now **only created for packages not already in SCA** (matching by `PkgName`)
@@ -720,6 +778,7 @@ curl "http://dvja:8080/userSearch.action" \
 | Open redirect not detected | Add custom CodeQL query for Struts2 redirect result types with user-controlled URLs |
 | Access control not detected | Implement DAST scans with authenticated and unauthenticated sessions to compare access |
 | Configuration issues not detected | Add configuration scanning (e.g., `struts.devMode` checks, hardcoded secrets in properties) |
+| Container build tool noise | Adopt multi-stage Dockerfile to eliminate Maven/Plexus/XStream from production image (see Section 5.4) |
 
 ### 8.2 Remediation Priority
 
@@ -738,6 +797,7 @@ curl "http://dvja:8080/userSearch.action" \
 | **P2 — Medium** | CSRF | Implement Struts2 `TokenSessionInterceptor` |
 | **P2 — Medium** | Sensitive data in logs | Remove password from log statements |
 | **P2 — Medium** | devMode=true | Set `struts.devMode=false` in production |
+| **P2 — Medium** | Docker build tools in image | Use multi-stage Dockerfile (see Section 5.4) — eliminates 5 container-only findings |
 | **P3 — Low** | Remaining dependency updates | Update all dependencies to latest stable versions |
 
 ---
