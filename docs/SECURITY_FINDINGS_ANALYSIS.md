@@ -342,11 +342,11 @@ The container scan found 5 packages not present in the SCA results. Upon investi
 
 | Package | Version | Unique CVEs | Where It Lives | In WAR? | Risk Level |
 |---------|---------|-------------|----------------|---------|------------|
-| com.thoughtworks.xstream:xstream | 1.4.10 | ~8 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
-| org.codehaus.plexus:plexus-utils | 3.0.15 | ~2 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
-| org.codehaus.plexus:plexus-archiver | 2.1 | ~1 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
-| org.apache.maven:maven-core | 3.0.4 | ~1 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
-| org.apache.maven.shared:maven-shared-utils | 0.1 | 1 | `/usr/share/maven/lib/` | **No** | Low — build tool only |
+| com.thoughtworks.xstream:xstream | 1.4.10 | ~8 | `/usr/share/maven/lib/` | **No** | Medium — post-exploitation (deserialization RCE) |
+| org.codehaus.plexus:plexus-utils | 3.0.15 | ~2 | `/usr/share/maven/lib/` | **No** | Medium — post-exploitation (path traversal) |
+| org.codehaus.plexus:plexus-archiver | 2.1 | ~1 | `/usr/share/maven/lib/` | **No** | Low — post-exploitation (archive path traversal) |
+| org.apache.maven:maven-core | 3.0.4 | ~1 | `/usr/share/maven/lib/` | **No** | Medium — attacker can use Maven to fetch tools |
+| org.apache.maven.shared:maven-shared-utils | 0.1 | 1 | `/usr/share/maven/lib/` | **No** | Medium — post-exploitation (command injection) |
 
 **How we verified this:** We ran `mvn dependency:tree` and confirmed that none of these packages appear in the application's dependency tree. They are not bundled in the WAR file (`WEB-INF/lib/`), which means the running Java application never loads them.
 
@@ -366,13 +366,22 @@ This is a common anti-pattern in Docker. The build tools are only needed during 
 
 ### 5.3 Are These False Positives?
 
-**Strictly speaking, no** — the vulnerable JARs genuinely exist inside the Docker image, and the CVEs are real. Trivy correctly reports them. However, they are **not exploitable through the application** because:
+**No — they are true positives**, and in the context of DVJA they are clearly within scope. While these JARs are not on the Java application's classpath (not in the WAR), DVJA has **multiple trivially exploitable RCE vulnerabilities** (Struts2 CVE-2017-5638, Command Injection, Log4Shell) that give an attacker shell access to the container with a single HTTP request. Once inside, these build tools become part of the **post-exploitation attack surface**:
 
-1. They are not on the Java application's classpath (not in the WAR)
-2. The application code never imports or calls any of these libraries
-3. An attacker would need to already have shell access to the container to interact with these files
+| Build Tool | Post-Exploitation Risk |
+|------------|----------------------|
+| **xstream 1.4.10** (CVE-2021-39144, CVE-2021-21344) | Attacker can craft deserialization payloads using XStream JARs present on disk to escalate privileges, pivot laterally, or establish persistence |
+| **maven-shared-utils 0.1** (CVE-2022-29599) | Command injection in Maven's utility classes — useful for chaining commands or bypassing restricted shells |
+| **plexus-utils 3.0.15** (CVE-2022-4244) | Path traversal — attacker could read/write files outside intended directories |
+| **maven-core 3.0.4** | Full Maven installation available — attacker can download and build additional tools from within the container |
+| **plexus-archiver 2.1** | Archive extraction path traversal — could be used to overwrite files |
 
-In practice, these are **"build artifact noise"** — findings caused by poor container hygiene rather than application-level vulnerabilities. They represent an **unnecessary attack surface expansion**: if an attacker gains Remote Code Execution through a real vulnerability (e.g., Struts2 CVE-2017-5638), these extra tools in the image could potentially be leveraged for further exploitation.
+The exploitation chain looks like this:
+1. **Initial access**: Exploit Struts2 CVE-2017-5638 (one HTTP request) → shell on container
+2. **Post-exploitation**: Leverage Maven/XStream/Plexus JARs already on disk for privilege escalation, lateral movement, or persistence
+3. **Impact**: Build tools like Maven can even fetch and compile new attack tools from the internet, turning the container into an attack staging platform
+
+These findings illustrate why **container hardening matters**: even if a vulnerability is not directly reachable from outside, the presence of unnecessary tools expands the blast radius after initial compromise. In a properly hardened container (multi-stage build, no build tools), an attacker who gains shell access would find a minimal environment with far fewer options for further exploitation.
 
 ### 5.4 Recommended Fix — Multi-Stage Dockerfile
 
