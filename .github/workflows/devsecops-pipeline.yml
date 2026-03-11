@@ -446,7 +446,14 @@ jobs:
 
             // ────────────────────────────────────
             //  2. TRIVY IMAGE → [CONTAINER] issues
+            //     Only for packages NOT already in SCA (avoids duplication).
+            //     Deduplicates CVEs that appear at multiple paths in the image.
             // ────────────────────────────────────
+            const scaPkgNames = new Set(issues.map(i => {
+              const m = i.title.match(/\[DEPENDENCY\]\s+(.+?)\s+—/);
+              return m ? m[1] : null;
+            }).filter(Boolean));
+
             const imgPath = './reports/trivy-image-results.json';
             if (fs.existsSync(imgPath)) {
               try {
@@ -455,13 +462,16 @@ jobs:
                 for (const res of (report.Results || [])) {
                   for (const v of (res.Vulnerabilities || [])) {
                     if (!['CRITICAL','HIGH'].includes(v.Severity)) continue;
-                    if (!pkgs.has(v.PkgName)) pkgs.set(v.PkgName, { vulns: [], max: 'HIGH' });
+                    if (!pkgs.has(v.PkgName)) pkgs.set(v.PkgName, { vulns: new Map(), max: 'HIGH' });
                     const e = pkgs.get(v.PkgName);
-                    e.vulns.push(v);
+                    if (!e.vulns.has(v.VulnerabilityID)) e.vulns.set(v.VulnerabilityID, v);
                     if (v.Severity === 'CRITICAL') e.max = 'CRITICAL';
                   }
                 }
-                for (const [pkg, { vulns, max }] of pkgs) {
+                let containerSkipped = 0;
+                for (const [pkg, { vulns: vulnMap, max }] of pkgs) {
+                  if (scaPkgNames.has(pkg)) { containerSkipped++; continue; }
+                  const vulns = [...vulnMap.values()];
                   const n = vulns.length;
                   const title = `[${max}][CONTAINER] ${pkg} — ${n} vulnerabilit${n === 1 ? 'y' : 'ies'}`;
                   const installed = vulns[0].InstalledVersion || 'N/A';
@@ -472,10 +482,10 @@ jobs:
                   const body = [
                     `## ${SEV_EMOJI[max]} Container Vulnerability: \`${pkg}\``,
                     '', '| Field | Value |', '|-------|-------|',
-                    `| **OS Package** | \`${pkg}\` |`,
+                    `| **Package** | \`${pkg}\` |`,
                     `| **Installed** | \`${installed}\` |`,
                     `| **Fix available** | ${fixes.length ? `\`${fixes.join('`, `')}\`` : 'No fix available'} |`,
-                    `| **Detected by** | Trivy image scan |`,
+                    `| **Detected by** | Trivy image scan (not in SCA / pom.xml) |`,
                     '', `### Vulnerabilities (${n})`, '',
                     '| Severity | CVE | Fixed In | Description |',
                     '|----------|-----|----------|-------------|',
@@ -488,6 +498,7 @@ jobs:
                   ].join('\n');
                   issues.push({ title, body, labels: ['security', max.toLowerCase(), 'container'], severity: max });
                 }
+                console.log(`Container scan: ${pkgs.size} packages found, ${containerSkipped} skipped (already in SCA), ${pkgs.size - containerSkipped} container-only issues created`);
               } catch (e) { console.log(`Container parse error: ${e.message}`); }
             } else { console.log('No container results file found at ' + imgPath); }
 

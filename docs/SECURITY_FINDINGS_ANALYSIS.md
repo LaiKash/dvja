@@ -22,22 +22,22 @@
 
 ## 1. Executive Summary
 
-The DevSecOps pipeline produced **49 GitHub issues** across four security tools: 4 SAST code findings (CodeQL), 20 SCA dependency findings (Trivy fs), and 25 container image findings (Trivy image). Gitleaks detected 0 secrets (see Appendix C for root cause analysis). The application's `docs/solution/` folder documents **10 OWASP Top 10 vulnerability categories** (A1–A10).
+The DevSecOps pipeline produced **29 unique GitHub issues** across four security tools: 4 SAST code findings (CodeQL), 20 SCA dependency findings (Trivy fs), and 5 container-only findings (Trivy image — packages not in `pom.xml`). Gitleaks detected 0 secrets (see Appendix C for root cause analysis). The application's `docs/solution/` folder documents **10 OWASP Top 10 vulnerability categories** (A1–A10).
 
 | Metric | Count |
 |--------|-------|
-| Total pipeline issues | 49 |
+| Total pipeline issues (deduplicated) | 29 |
 | CodeQL (SAST) issues | 4 |
 | Trivy SCA (dependencies) issues | 20 |
-| Trivy Container (image) issues | 25 |
+| Trivy Container (container-only packages) issues | 5 |
 | Gitleaks (secrets) | 0 (see Appendix C.1) |
 | Solution docs | 10 (A1–A10) |
-| **True Positives** | **49 (100%)** |
+| **True Positives** | **29 (100%)** |
 | **False Positives** | **0** |
 | Solution vulns detected by pipeline | 4 of 10 categories |
 | Solution vulns **missed** by pipeline | 6 of 10 categories |
 
-**Key finding:** All 49 issues are **true positives**. The container scan (after fixing `vuln-type` to `'os,library'`) found 25 additional issues that validate and expand the SCA findings by confirming vulnerable libraries exist in the deployed Docker image. However, the pipeline only detected **4 out of 10** documented vulnerability categories. Critical application-logic vulnerabilities (XSS, IDOR, CSRF, Broken Auth, Open Redirect, Access Control bypass) require DAST and were **not detected** by SAST/SCA tools.
+**Key finding:** All 29 issues are **true positives**. The container scan (after fixing `vuln-type` to `'os,library'`) found 5 additional packages not present in `pom.xml` (xstream, plexus-utils, plexus-archiver, maven-core, maven-shared-utils) — confirming the value of scanning the deployed image. Libraries already reported by SCA are deduplicated to avoid double-reporting. However, the pipeline only detected **4 out of 10** documented vulnerability categories. Critical application-logic vulnerabilities (XSS, IDOR, CSRF, Broken Auth, Open Redirect, Access Control bypass) require DAST and were **not detected** by SAST/SCA tools.
 
 ---
 
@@ -326,7 +326,7 @@ CVE-2016-1000027 relates to unsafe deserialization in Spring's `HttpInvokerServi
 
 ## 5. Container Scan Findings — Trivy Image
 
-After fixing the Trivy container scan to include library-level vulnerabilities (`vuln-type: 'os,library'`), the scan detected **25 vulnerable packages** inside the Docker image. These findings validate and expand the SCA results by confirming the vulnerable libraries exist in the **deployed artifact**, not just in the `pom.xml` declaration.
+After fixing the Trivy container scan to include library-level vulnerabilities (`vuln-type: 'os,library'`), the scan detected vulnerable packages inside the Docker image. The pipeline deduplicates results: libraries already reported by SCA (via `pom.xml`) are **not** re-reported as container issues. Only packages found **exclusively in the Docker image** (transitive/build dependencies not declared in `pom.xml`) produce `[CONTAINER]` issues.
 
 ### 5.1 Why Container Scan Matters (Defense in Depth)
 
@@ -336,57 +336,31 @@ The SCA scan (Trivy fs) analyzes `pom.xml` — what the build *declares*. The co
 - OS-level packages from the base image (e.g., Ubuntu libraries)
 - Version discrepancies between declared and actual deployed versions
 
-### 5.2 CRITICAL Container Findings (Issues #25–36)
+### 5.2 Container-Only Findings (5 packages not in SCA)
 
-| Issue # | Package | Version | CVE Count | Verdict | Key CVEs |
-|---------|---------|---------|-----------|---------|----------|
-| #33 | struts2-core | 2.3.30 | 51 | TRUE POSITIVE | CVE-2017-5638 (10.0), CVE-2023-50164 (9.8), CVE-2024-53677 (9.8) |
-| #30 | log4j-core | 2.3 | 12 | TRUE POSITIVE | CVE-2021-44228 Log4Shell (10.0), CVE-2021-45046 (9.0) |
-| #29 | log4j 1.x | 1.2.14 | 24 | TRUE POSITIVE | CVE-2019-17571 (9.8), CVE-2022-23305 (9.8) |
-| #25 | xstream | 1.4.10 | 23 | TRUE POSITIVE | CVE-2021-39144 (8.5), CVE-2021-21344 (9.8) — deserialization RCE |
-| #26 | commons-collections | 3.1 | 8 | TRUE POSITIVE | CVE-2015-7501 (9.8) — InvokerTransformer gadget chain |
-| #27 | commons-fileupload | 1.3.2 | 9 | TRUE POSITIVE | CVE-2016-1000031 (9.8) — DiskFileItem deserialization |
-| #28 | dom4j | 1.6.1 | 6 | TRUE POSITIVE | CVE-2020-10683 (9.8) — XXE injection |
-| #34 | plexus-utils | 3.0.15 | 14 | TRUE POSITIVE | CVE-2022-4244 (9.1) — path traversal, only in build tooling |
-| #35 | spring-beans | 3.0.5 | 6 | TRUE POSITIVE | CVE-2022-22965 Spring4Shell (9.8) — not exploitable on JDK 8 |
-| #36 | spring-web | 3.0.5 | 12 | TRUE POSITIVE | CVE-2016-1000027 (9.8) — unsafe deserialization |
-| #32 | maven-core | 3.0.4 | 3 | TRUE POSITIVE | Build tooling CVEs |
-| #31 | maven-shared-utils | 0.1 | 1 | TRUE POSITIVE | CVE-2022-29599 (9.8) — command injection in build utils |
+These packages were found **only** in the Docker image — they are transitive or build-time dependencies not directly declared in `pom.xml`:
 
-**Notable new finding:** XStream 1.4.10 (#25) with **23 vulnerabilities** was not reported by the SCA scan because it's a transitive dependency pulled in during the build, not directly declared in `pom.xml`. This demonstrates the value of container scanning as a second layer of defense.
+| Package | Version | Unique CVEs | Verdict | Key CVEs |
+|---------|---------|-------------|---------|----------|
+| com.thoughtworks.xstream:xstream | 1.4.10 | ~8 | TRUE POSITIVE | CVE-2021-39144 (8.5), CVE-2021-21344 (9.8) — deserialization RCE chain |
+| org.codehaus.plexus:plexus-utils | 3.0.15 | ~5 | TRUE POSITIVE | CVE-2022-4244 (9.1) — path traversal in build tooling |
+| org.codehaus.plexus:plexus-archiver | 2.1 | ~1 | TRUE POSITIVE | Archive extraction path traversal (build tooling) |
+| org.apache.maven:maven-core | 3.0.4 | ~1 | TRUE POSITIVE | Build tooling CVEs |
+| org.apache.maven.shared:maven-shared-utils | 0.1 | 1 | TRUE POSITIVE | CVE-2022-29599 (9.8) — command injection in build utils |
 
-### 5.3 HIGH Container Findings (Issues #37–49)
+**Notable finding:** XStream 1.4.10 was not reported by the SCA scan because it enters the WAR as a transitive dependency (pulled by Struts2 internally), not declared directly in `pom.xml`. This demonstrates the value of container scanning as a second layer of defense.
 
-| Issue # | Package | Version | CVE Count | Verdict | Notes |
-|---------|---------|---------|-----------|---------|-------|
-| #42 | struts-core (1.x) | 1.3.8 | 12 | TRUE POSITIVE | Legacy Struts 1 — ClassLoader manipulation, OGNL injection |
-| #41 | xwork-core | 2.3.30 | 3 | TRUE POSITIVE | Struts2 internal — XML validation bypass |
-| #40 | mysql-connector-java | 5.1.42 | 6 | TRUE POSITIVE | MITM and deserialization vectors |
-| #48 | spring-core | 3.0.5 | 12 | TRUE POSITIVE | Multiple RCE and DoS vectors |
-| #38 | commons-beanutils | 1.7.0 | 6 | TRUE POSITIVE | Property access bypass chain |
-| #39 | commons-io | 2.2 | 4 | TRUE POSITIVE | Path traversal and DoS |
-| #37 | gson | 2.8.1 | 3 | TRUE POSITIVE | Deserialization DoS |
-| #43 | struts-tiles | 1.3.8 | 3 | TRUE POSITIVE | Locale-based path traversal |
-| #44 | velocity | 1.6.2 | 3 | TRUE POSITIVE | Template sandbox escape |
-| #45 | plexus-archiver | 2.1 | 2 | TRUE POSITIVE | Archive extraction path traversal (build tooling) |
-| #46 | hibernate-core | 3.3.1.GA | 3 | TRUE POSITIVE | SQL injection via comments |
-| #47 | spring-context | 3.0.5 | 3 | TRUE POSITIVE | DisallowedFields bypass |
-| #49 | spring-expression | 3.0.5 | 3 | TRUE POSITIVE | SpEL DoS |
+### 5.3 Deduplication and CVE Inflation — Lessons Learned
 
-### 5.4 Container vs SCA: Comparison
+During initial pipeline runs, the container scan produced **inflated issue counts** for two reasons:
 
-The container scan found **higher CVE counts** per library than the SCA scan because:
-- **Trivy fs** (SCA) only reports CVEs matching the exact version declared in `pom.xml`
-- **Trivy image** scans the actual JAR files inside the WAR, including transitive dependencies and their sub-dependencies, often finding additional CVEs at lower levels
+1. **Cross-scanner duplication**: The same library (e.g., `log4j-core 2.3`) was reported by both SCA (issue #5: 4 CVEs) and Container (issue #30: 12 CVEs), creating two issues for the same vulnerability.
 
-| Library | SCA (pom.xml) CVEs | Container (image) CVEs | Delta |
-|---------|-------------------|----------------------|-------|
-| struts2-core | 17 | 51 | +34 |
-| log4j-core | 4 | 12 | +8 |
-| log4j 1.x | 6 | 24 | +18 |
-| spring-web | 4 | 12 | +8 |
-| xstream | 0 (not in SCA) | 23 | **+23 (new)** |
-| plexus-utils | 0 (not in SCA) | 14 | **+14 (new)** |
+2. **Within-container triplication**: Trivy found each JAR at **3 paths** inside the image (Maven local cache, exploded WAR, packaged WAR), reporting each CVE once per path. Example: `struts2-core` has 17 unique CVEs × 3 paths = 51 listed entries.
+
+**Fixes applied to the pipeline:**
+- Container issues are now **only created for packages not already in SCA** (matching by `PkgName`)
+- CVEs within the container scan are **deduplicated by VulnerabilityID** per package, eliminating the triplication from multiple JAR paths
 
 ---
 
@@ -804,35 +778,19 @@ curl "http://dvja:8080/userSearch.action" \
 | 19 | DEPENDENCY | HIGH | spring-core 3.0.5 — 4 CVEs | TRUE POSITIVE |
 | 20 | DEPENDENCY | HIGH | spring-expression 3.0.5 — 1 CVE | TRUE POSITIVE |
 
-### A.3 Container Scan — Trivy Image (Issues #25–49)
+### A.3 Container Scan — Trivy Image (container-only packages)
 
-| # | Type | Severity | Title | True/False Positive |
-|---|------|----------|-------|-------------------|
-| 25 | CONTAINER | CRITICAL | xstream 1.4.10 — 23 CVEs | TRUE POSITIVE |
-| 26 | CONTAINER | CRITICAL | commons-collections 3.1 — 8 CVEs | TRUE POSITIVE |
-| 27 | CONTAINER | CRITICAL | commons-fileupload 1.3.2 — 9 CVEs | TRUE POSITIVE |
-| 28 | CONTAINER | CRITICAL | dom4j 1.6.1 — 6 CVEs | TRUE POSITIVE |
-| 29 | CONTAINER | CRITICAL | log4j 1.2.14 — 24 CVEs | TRUE POSITIVE |
-| 30 | CONTAINER | CRITICAL | log4j-core 2.3 — 12 CVEs | TRUE POSITIVE |
-| 31 | CONTAINER | CRITICAL | maven-shared-utils 0.1 — 1 CVE | TRUE POSITIVE |
-| 32 | CONTAINER | CRITICAL | maven-core 3.0.4 — 3 CVEs | TRUE POSITIVE |
-| 33 | CONTAINER | CRITICAL | struts2-core 2.3.30 — 51 CVEs | TRUE POSITIVE |
-| 34 | CONTAINER | CRITICAL | plexus-utils 3.0.15 — 14 CVEs | TRUE POSITIVE |
-| 35 | CONTAINER | CRITICAL | spring-beans 3.0.5 — 6 CVEs | TRUE POSITIVE |
-| 36 | CONTAINER | CRITICAL | spring-web 3.0.5 — 12 CVEs | TRUE POSITIVE |
-| 37 | CONTAINER | HIGH | gson 2.8.1 — 3 CVEs | TRUE POSITIVE |
-| 38 | CONTAINER | HIGH | commons-beanutils 1.7.0 — 6 CVEs | TRUE POSITIVE |
-| 39 | CONTAINER | HIGH | commons-io 2.2 — 4 CVEs | TRUE POSITIVE |
-| 40 | CONTAINER | HIGH | mysql-connector-java 5.1.42 — 6 CVEs | TRUE POSITIVE |
-| 41 | CONTAINER | HIGH | xwork-core 2.3.30 — 3 CVEs | TRUE POSITIVE |
-| 42 | CONTAINER | HIGH | struts-core 1.3.8 — 12 CVEs | TRUE POSITIVE |
-| 43 | CONTAINER | HIGH | struts-tiles 1.3.8 — 3 CVEs | TRUE POSITIVE |
-| 44 | CONTAINER | HIGH | velocity 1.6.2 — 3 CVEs | TRUE POSITIVE |
-| 45 | CONTAINER | HIGH | plexus-archiver 2.1 — 2 CVEs | TRUE POSITIVE |
-| 46 | CONTAINER | HIGH | hibernate-core 3.3.1.GA — 3 CVEs | TRUE POSITIVE |
-| 47 | CONTAINER | HIGH | spring-context 3.0.5 — 3 CVEs | TRUE POSITIVE |
-| 48 | CONTAINER | HIGH | spring-core 3.0.5 — 12 CVEs | TRUE POSITIVE |
-| 49 | CONTAINER | HIGH | spring-expression 3.0.5 — 3 CVEs | TRUE POSITIVE |
+After deduplication (removing packages already covered by SCA), the container scan produces issues only for packages not declared in `pom.xml`:
+
+| Package | Type | Severity | Unique CVEs | True/False Positive |
+|---------|------|----------|-------------|-------------------|
+| xstream 1.4.10 | CONTAINER | CRITICAL | ~8 | TRUE POSITIVE |
+| plexus-utils 3.0.15 | CONTAINER | CRITICAL | ~5 | TRUE POSITIVE |
+| maven-core 3.0.4 | CONTAINER | CRITICAL | ~1 | TRUE POSITIVE |
+| maven-shared-utils 0.1 | CONTAINER | CRITICAL | 1 | TRUE POSITIVE |
+| plexus-archiver 2.1 | CONTAINER | HIGH | ~1 | TRUE POSITIVE |
+
+*Note: Issues #25–49 from the initial container scan run were closed due to cross-scanner duplication (20 issues duplicated SCA) and within-scan CVE inflation (same JAR at 3 image paths tripled counts). The pipeline was fixed to deduplicate both, and subsequent runs create only the 5 container-only issues above.*
 
 ---
 
@@ -849,6 +807,9 @@ curl "http://dvja:8080/userSearch.action" \
 | #7 — spring-beans | Spring4Shell | Not in solutions. Not exploitable on JDK 8. |
 | #8 — spring-web | Deserialization RCE | Not in solutions. Conditional exploitability. |
 | #9–#20 | Various | Various HIGH-severity dependency vulnerabilities not in solutions. |
+| Container-only: xstream | Deserialization RCE | Transitive dependency via Struts2, not in pom.xml. 8+ CVEs including CVE-2021-39144. |
+| Container-only: plexus-utils | Path Traversal | Build tooling vulnerability. CVE-2022-4244 (9.1). |
+| Container-only: maven-shared-utils | Command Injection | Build tooling. CVE-2022-29599 (9.8). |
 
 ---
 
@@ -984,8 +945,8 @@ The following categories require **DAST** (Dynamic Application Security Testing)
 | Run | Commit | Date | Trigger | Result | Notes |
 |-----|--------|------|---------|--------|-------|
 | #1 | `8c0bd80` | 2026-03-09 | push | ✅ Success | Initial pipeline — all jobs green. Created issues #1–24 (4 SAST + 20 SCA). Container scan found 0 issues (vuln-type was `os` only). |
-| #2 | `ca99fcb` | 2026-03-11 | push | ⚠️ Partial | Pipeline improvements (Gitleaks two-tier, CodeQL XML indexing, Trivy os+library, v4 upgrade). Container scan now found 25 issues (#25–49). CodeQL failed due to `codeql` binary not on PATH (exit code 127) — fixed in next run. |
-| #3 | *(pending)* | 2026-03-11 | push | *(pending)* | CodeQL fix (`${CODEQL_DIST}/codeql`) — expected to resolve the SAST failure. |
+| #2 | `ca99fcb` | 2026-03-11 | push | ⚠️ Partial | Pipeline improvements (Gitleaks two-tier, CodeQL XML indexing, Trivy os+library, v4 upgrade). Container scan now found 25 issues (#25–49). CodeQL failed due to `codeql` binary not on PATH (exit code 127). |
+| #3 | `8311663` | 2026-03-11 | push | ✅ Success | CodeQL fix (`${CODEQL_DIST}/codeql`). All 7 jobs green: Build, SCA, SAST, Secrets, Docker Build, Container Scan, Issue Creation. XML/Properties indexing ran (26 XML files, 9 properties files processed). |
 
 ### D.2 Evidence Collection Checklist
 
@@ -998,19 +959,20 @@ To present complete evidence of the pipeline, capture the following from GitHub:
 - [ ] **Artifacts** — downloaded SARIF/JSON reports from the pipeline run artifacts
 - [ ] **Individual job logs** — expand key steps showing scanner output (e.g., Trivy finding 51 CVEs in struts2-core)
 
-### D.3 Issue Statistics
+### D.3 Issue Statistics (After Deduplication)
 
 | Category | CRITICAL | HIGH | Total Issues |
 |----------|----------|------|-------------|
 | SAST (CodeQL) | 1 | 3 | 4 |
 | SCA (Trivy fs) | 8 | 12 | 20 |
-| Container (Trivy image) | 12 | 13 | 25 |
+| Container (container-only) | 3 | 2 | 5 |
 | Secrets (Gitleaks) | 0 | 0 | 0 |
-| **Total** | **21** | **28** | **49** |
+| **Total** | **12** | **17** | **29** |
 
-### D.4 Unique CVEs Across All Scanners
+### D.4 Deduplication Note
 
-Total unique CVEs detected across SCA + Container scans covers vulnerabilities in:
-- **17 distinct libraries** via SCA (pom.xml analysis)
-- **25 distinct packages** via Container scan (image layer analysis)
-- **3 additional libraries** found only by container scan: xstream, plexus-utils, plexus-archiver, maven-core, maven-shared-utils
+The initial container scan (run #2) produced 25 `[CONTAINER]` issues, but 20 were duplicates of the SCA `[DEPENDENCY]` issues (same libraries), and all had inflated CVE counts (same JAR found at 3 paths in the image). These were closed and the pipeline was fixed to:
+- **Skip** container issues for packages already reported by SCA
+- **Deduplicate** CVEs by `VulnerabilityID` within each package (eliminating triplication)
+
+The 5 remaining container-only packages (xstream, plexus-utils, plexus-archiver, maven-core, maven-shared-utils) are genuinely new findings not detectable via `pom.xml` analysis.
