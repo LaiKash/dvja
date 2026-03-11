@@ -46,6 +46,10 @@ jobs:
 
   # ──────────────────────────────────────────────
   # JOB 2: Secrets Detection (Gitleaks)
+  #   - Incremental scan (last commit) on push
+  #   - Full file scan (--no-git) on PR to main/master
+  #   - For full git-history audit, use workflow_dispatch
+  #     with: gitleaks detect --log-opts=--all
   # ──────────────────────────────────────────────
   secrets-scan:
     name: Secrets Detection
@@ -58,12 +62,27 @@ jobs:
         with:
           fetch-depth: 0      # full history needed for accurate scan
 
-      - name: Run Gitleaks
-        id: gitleaks
+      - name: Run Gitleaks (incremental – push)
+        if: github.event_name == 'push'
+        id: gitleaks-push
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # optional for public repos
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+      - name: Run Gitleaks (full file scan – PR)
+        if: github.event_name == 'pull_request'
+        id: gitleaks-pr
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_8.24.3_linux_x64.tar.gz | tar xz -C /tmp
+          /tmp/gitleaks detect \
+            --no-git \
+            --redact \
+            -v \
+            --exit-code=0 \
+            --report-format=sarif \
+            --report-path=results.sarif
         continue-on-error: true
 
       - name: Upload Gitleaks report
@@ -91,7 +110,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: java
           queries: security-and-quality
@@ -105,8 +124,20 @@ jobs:
       - name: Build for CodeQL
         run: mvn clean package -DskipTests --batch-mode
 
+      - name: Index XML and properties files
+        run: |
+          codeql database index-files \
+            --language xml \
+            --include-extension .xml \
+            -- ${{ runner.temp }}/codeql_databases/java
+
+          codeql database index-files \
+            --language xml \
+            --include-extension .properties \
+            -- ${{ runner.temp }}/codeql_databases/java
+
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:java"
           output: codeql-results
@@ -155,7 +186,7 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy SCA SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-sca.sarif
           category: trivy-sca
@@ -245,7 +276,7 @@ jobs:
         with:
           scan-type: 'image'
           image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
-          vuln-type: 'os'
+          vuln-type: 'os,library'
           format: 'json'
           output: 'trivy-image-results.json'
           severity: 'CRITICAL,HIGH'
@@ -256,14 +287,14 @@ jobs:
         with:
           scan-type: 'image'
           image-ref: '${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}'
-          vuln-type: 'os'
+          vuln-type: 'os,library'
           format: 'sarif'
           output: 'trivy-image.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
 
       - name: Upload container SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-container
