@@ -126,12 +126,12 @@ jobs:
 
       - name: Index XML and properties files
         run: |
-          codeql database index-files \
+          "${CODEQL_DIST}/codeql" database index-files \
             --language xml \
             --include-extension .xml \
             -- ${{ runner.temp }}/codeql_databases/java
 
-          codeql database index-files \
+          "${CODEQL_DIST}/codeql" database index-files \
             --language xml \
             --include-extension .properties \
             -- ${{ runner.temp }}/codeql_databases/java
@@ -151,7 +151,7 @@ jobs:
           path: codeql-results/
           if-no-files-found: ignore
 
-  # ──────────────────────────────────────────────
+  # ─────────────–────────────────────────────────
   # JOB 4: SCA – Trivy dependency scan
   # ──────────────────────────────────────────────
   trivy-sca:
