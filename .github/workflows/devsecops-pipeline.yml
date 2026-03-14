@@ -12,9 +12,8 @@ env:
 
 jobs:
 
-  # ──────────────────────────────────────────────
   # JOB 1: Build the Maven application
-  # ──────────────────────────────────────────────
+
   build:
     name: Build Application
     runs-on: ubuntu-latest
@@ -44,13 +43,12 @@ jobs:
           name: dvja-war
           path: target/*.war
 
-  # ──────────────────────────────────────────────
   # JOB 2: Secrets Detection (Gitleaks + detect-secrets)
   #   Gitleaks  → provider-specific tokens + git-history
   #   detect-secrets → generic passwords/keys via keyword + entropy
   #   For full git-history audit, use workflow_dispatch
   #     with: gitleaks detect --log-opts=--all
-  # ──────────────────────────────────────────────
+
   secrets-scan:
     name: Secrets Detection
     runs-on: ubuntu-latest
@@ -103,9 +101,8 @@ jobs:
           path: detect-secrets-results.json
           if-no-files-found: ignore
 
-  # ──────────────────────────────────────────────
   # JOB 3: SAST – CodeQL
-  # ──────────────────────────────────────────────
+
   codeql-sast:
     name: SAST – CodeQL
     runs-on: ubuntu-latest
@@ -157,9 +154,8 @@ jobs:
           path: codeql-results/
           if-no-files-found: ignore
 
-  # ─────────────–────────────────────────────────
   # JOB 4: SCA – Trivy dependency scan
-  # ──────────────────────────────────────────────
+
   trivy-sca:
     name: SCA – Trivy Dependencies
     runs-on: ubuntu-latest
@@ -204,9 +200,8 @@ jobs:
           name: trivy-sca-results
           path: trivy-sca-results.json
 
-  # ──────────────────────────────────────────────
   # JOB 5: Build & Push Docker image
-  # ──────────────────────────────────────────────
+
   docker-build-push:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
@@ -256,9 +251,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ──────────────────────────────────────────────
   # JOB 6: Container Security – Trivy image scan
-  # ──────────────────────────────────────────────
+
   trivy-container:
     name: Container Security – Trivy Image Scan
     runs-on: ubuntu-latest
@@ -312,13 +306,11 @@ jobs:
           name: trivy-image-results
           path: trivy-image-results.json
 
-  # ──────────────────────────────────────────────
   # JOB 7: Create GitHub Issues for HIGH/CRITICAL
   #   - Groups by package (DEPENDENCY/CONTAINER)
   #     or by rule (CODE) or as single (SECRET)
   #   - Deduplicates against existing open issues
-  #   - Capped at 50 issues per run to prevent flooding
-  # ──────────────────────────────────────────────
+
   create-security-issues:
     name: Create Security Issues
     runs-on: ubuntu-latest
@@ -374,7 +366,7 @@ jobs:
             const fs = require('fs');
             const path = require('path');
 
-            const MAX_ISSUES_PER_RUN = 50;
+            
             const SEV_EMOJI = { CRITICAL: '🔴', HIGH: '🟠' };
             const { owner, repo } = context.repo;
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
@@ -669,11 +661,10 @@ jobs:
             // ── Sort CRITICAL first, then HIGH ──
             issues.sort((a, b) => (a.severity === b.severity) ? 0 : a.severity === 'CRITICAL' ? -1 : 1);
 
-            // ── Create issues with dedup + cap ──
-            let created = 0, skipped = 0, capped = 0;
+            // ── Create issues with dedup ──
+            let created = 0, skipped = 0;
             for (const issue of issues) {
               if (existingTitles.has(issue.title)) { skipped++; continue; }
-              if (created >= MAX_ISSUES_PER_RUN) { capped++; continue; }
               try {
                 await github.rest.issues.create({
                   owner, repo,
@@ -699,6 +690,5 @@ jobs:
             }
 
             console.log(`\n── Summary ──`);
-            console.log(`Created: ${created} | Skipped (existing): ${skipped} | Capped: ${capped}`);
+            console.log(`Created: ${created} | Skipped (existing): ${skipped}`);
             console.log(`Total findings across all scanners: ${issues.length}`);
-            if (capped > 0) console.log(`⚠️ ${capped} issues deferred — will be created in subsequent runs.`);

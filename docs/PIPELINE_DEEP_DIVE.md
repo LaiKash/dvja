@@ -641,6 +641,47 @@ Stage 4: Block HIGH+     → exit-code: 1 for HIGH and CRITICAL
 Stage 5: Full enforcement → Required status checks, branch protection
 ```
 
+### Introducing the pipeline to a large existing project
+
+This pipeline was built for DVJA — a small application with ~30 findings. Introducing the same pipeline to a large legacy codebase (thousands of dependencies, years of accumulated tech debt) raises a different problem: the first run could generate **hundreds** of issues, overwhelming the team and undermining trust in the process.
+
+Strategies for onboarding a large project:
+
+**1. Baseline and suppress — fix forward**
+
+Run the pipeline once, capture all findings as a "baseline," and only create issues for *new* findings introduced after the baseline date. This is how `detect-secrets` works natively (`.secrets.baseline` file). For Trivy and CodeQL, you can implement this by recording existing issue titles and only creating issues for titles not in the baseline.
+
+```
+Day 1:  Run pipeline → 400 findings → store as baseline (no issues created)
+Day 2+: Run pipeline → only findings NOT in baseline create issues
+         → team fixes new findings as they appear
+         → separate backlog-reduction sprint tackles baseline items
+```
+
+**2. Gradual severity rollout**
+
+Start with CRITICAL only. Once those are cleared, add HIGH. This limits the initial flood:
+
+```
+Week 1-4:   Only CRITICAL findings create issues (~20 instead of ~400)
+Week 5-8:   Add HIGH findings
+Week 9+:    Enable enforcement (block merges)
+```
+
+**3. Per-team or per-directory scoping**
+
+For monorepos or large projects, scope the pipeline to specific directories or modules and roll out team by team. Trivy and CodeQL both support path filtering.
+
+**4. Issue caps — when they make sense**
+
+An issue cap (e.g., `MAX_ISSUES_PER_RUN = 50`) prevents the pipeline from creating hundreds of issues in one run. This is useful during the initial onboarding period, especially combined with CRITICAL-first sorting so the most important findings get created first. The cap was removed from this pipeline because DVJA's ~30 findings never hit it, and silently dropping findings is worse than creating them all. For a large project, a cap of 50-100 during the first few weeks is a reasonable safety net — remove it once the backlog stabilizes.
+
+**5. Don't skip the human step**
+
+Regardless of strategy, the first run's findings should be reviewed by a human before creating issues. Dump the SARIF/JSON to an artifact, have a security engineer triage it, then decide what becomes an issue vs. what gets added to the allowlist. Automation without triage creates noise; noise erodes developer trust; eroded trust kills DevSecOps adoption.
+
+The maturity model from the section above (`Monitor → Warn → Block CRITICAL → Block HIGH+ → Full enforcement`) applies to issue volume too. Start quiet, prove value, then turn up the dial.
+
 ### Build duplication
 
 The pipeline builds the application **twice**:
