@@ -213,23 +213,19 @@ Unlike simple text scanners, CodeQL needs the compiled bytecode to understand ty
 **The `security-and-quality` query suite:**
 This is CodeQL's extended query set. The default `security-extended` suite focuses purely on security. `security-and-quality` adds code quality rules that have security implications (like log injection). This is the recommended suite for security-focused pipelines.
 
-**XML and properties file indexing:**
+**XML configuration file indexing:**
 ```yaml
-- name: Index XML and properties files
+- name: Index XML configuration files
   run: |
     codeql database index-files \
       --language xml \
       --include-extension .xml \
       -- ${{ runner.temp }}/codeql_databases/java
-    codeql database index-files \
-      --language xml \
-      --include-extension .properties \
-      -- ${{ runner.temp }}/codeql_databases/java
 ```
 
-By default, CodeQL's Java extractor only captures `.java` and `.class` files. Configuration files like `struts.xml` and `config.properties` are invisible to queries unless explicitly indexed. This step adds them to the database, enabling:
-- Detection of `struts.devMode=true` (security misconfiguration)
-- Detection of hardcoded credentials in `.properties` files (CWE-555)
+By default, CodeQL's Java extractor only captures `.java` and `.class` files. Configuration files like `struts.xml` are invisible to queries unless explicitly indexed. This step adds `.xml` files to the database, enabling detection of `struts.devMode=true` (security misconfiguration).
+
+Note: an earlier iteration also indexed `.properties` files as XML, which was incorrect — `.properties` is `key=value` format, not XML, and the step failed silently. Hardcoded credentials in `.properties` files are covered by detect-secrets instead (see Job 2).
 
 **Permissions:**
 `security-events: write` is required because CodeQL uploads results to GitHub's Security tab (Code Scanning alerts), not just as a workflow artifact.
@@ -683,7 +679,7 @@ For maximum accuracy, you could add a step that runs `mvn dependency:tree -Doutp
 | **Struts2 CVE-2017-5638** (A9) | | | | **YES** | **YES** | YES |
 | **Log4Shell CVE-2021-44228** | | | | **YES** | **YES** | YES |
 | **Open Redirect** (A10) | | | | | | **YES** |
-| **Hardcoded credentials** in config.properties | | **YES** (KeywordDetector) | **YES** (with .properties indexing) | | | |
+| **Hardcoded credentials** in config.properties | | **YES** (KeywordDetector) | | | | |
 | **Hardcoded credentials** in docker-compose.yml | | **YES** (KeywordDetector + HexHighEntropy) | | | | |
 | **Log Injection** (CWE-117) | | | **YES** | | | |
 

@@ -1128,9 +1128,19 @@ Verified locally — `detect-secrets scan` with default plugins finds all 3 inst
 | **Gitleaks** (`--no-git`) | Provider-specific tokens (AWS, GitHub, Slack, etc.), git-history scanning, SARIF output | Catch high-confidence token leaks |
 | **detect-secrets** (default plugins) | Generic `password=value` keyword matching + entropy analysis in config files | Catch hardcoded credentials that Gitleaks misses |
 
-Findings from both scanners are **deduplicated by file:line** and merged into a single `[SECRET]` GitHub issue. This eliminates the need for custom Gitleaks rules (`.gitleaks.toml` only contains path exclusions).
+Findings from both scanners are **deduplicated by file:line** and merged into a single `[SECRET]` GitHub issue. This eliminates the need for custom Gitleaks rules.
 
-The `--no-git` flag on Gitleaks bypasses git history and scans all files on disk. This catches any secret currently present in the repo, regardless of when it was committed.
+**Scanning mode trade-offs:**
+
+The `--no-git` flag on Gitleaks bypasses git history and scans all files on disk. This catches any secret currently present in the repo, regardless of when it was committed. However, it introduces a genuine gap: secrets introduced within a PR's commits are not caught at the commit level — `--no-git` only sees the final working tree. Three modes cover three different threat surfaces:
+
+| Mode | What it catches | What it misses |
+|------|----------------|----------------|
+| `--no-git` (current default) | Any secret in the current working tree | Secrets added then deleted within the same PR; commit-level attribution |
+| Git-aware PR scan (Gitleaks default) | Secrets introduced in the PR's commits specifically | Pre-existing secrets committed before the pipeline was installed |
+| `--log-opts=--all` (audit mode) | Every secret ever committed across full history | Slow; impractical per-push |
+
+The current pipeline uses `--no-git` because the primary problem was pre-existing secrets in a forked repo that incremental scanning missed entirely. For a mature pipeline, combining git-aware PR scanning with `--no-git` would close the remaining gap.
 
 **For full git-history audits** (e.g., finding secrets that were committed and later removed — still in history, still need rotation), run a manual scan with `--log-opts=--all`:
 
@@ -1178,13 +1188,15 @@ jobs:
           path: results.sarif
 ```
 
-### C.2 CodeQL — Missing XML and Properties File Indexing
+### C.2 CodeQL — Missing XML Configuration Indexing
 
-**Observed behavior:** CodeQL did not detect `struts.devMode=true` (security misconfiguration) or hardcoded credentials in `config.properties`, despite having queries for both (`java/struts-dev-mode` via PR #3945, CWE-555 for properties files).
+**Observed behavior:** CodeQL did not detect `struts.devMode=true` (security misconfiguration) in `struts.xml`.
 
-**Root cause:** The `github/codeql-action/init@v3` with `languages: java` builds a database from compiled Java bytecode. Non-Java files (`.xml`, `.properties`) are not automatically indexed into the CodeQL database unless explicitly included via `codeql database index-files --include-extension .xml --include-extension .properties`.
+**Root cause:** The `github/codeql-action/init@v4` with `languages: java` builds a database from compiled Java bytecode. Non-Java files (`.xml`) are not automatically indexed unless explicitly included via `codeql database index-files`.
 
-**Remediation applied:** Added a `codeql database index-files` step between the Maven build and the CodeQL analysis, explicitly indexing `.xml` and `.properties` files into the Java database. This enables the Struts devMode and CWE-555 credential queries to find their targets.
+**Remediation applied:** Added a `codeql database index-files --language xml --include-extension .xml` step between the Maven build and the CodeQL analysis. This enables the Struts devMode query (`java/struts-dev-mode`) to find its target.
+
+**Note:** An earlier iteration also attempted to index `.properties` files as XML. This was incorrect — `.properties` files use `key=value` syntax, not XML, and the step failed silently due to `continue-on-error: true`. The `.properties` indexing has been removed. Hardcoded credentials in `config.properties` are now covered by detect-secrets instead.
 
 ### C.3 Trivy Container Scan — Zero Findings
 

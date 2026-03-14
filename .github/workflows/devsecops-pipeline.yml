@@ -134,17 +134,12 @@ jobs:
       - name: Build for CodeQL
         run: mvn clean package -DskipTests --batch-mode
 
-      - name: Index XML and properties files
+      - name: Index XML configuration files
         continue-on-error: true
         run: |
           "${CODEQL_DIST}/codeql" database index-files \
             --language xml \
             --include-extension .xml \
-            -- ${{ runner.temp }}/codeql_databases/java
-
-          "${CODEQL_DIST}/codeql" database index-files \
-            --language xml \
-            --include-extension .properties \
             -- ${{ runner.temp }}/codeql_databases/java
 
       - name: Perform CodeQL Analysis
