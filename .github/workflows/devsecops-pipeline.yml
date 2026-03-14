@@ -167,17 +167,17 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Run Trivy on filesystem (SCA)
+      - name: Run Trivy on filesystem (SCA) - JSON
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'json'
           output: 'trivy-sca-results.json'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-          exit-code: '0'          # non-blocking
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
 
-      - name: Also produce SARIF for GitHub Security tab
+      - name: Run Trivy on filesystem (SCA) - SARIF
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
@@ -372,7 +372,7 @@ jobs:
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             const today = new Date().toISOString().split('T')[0];
 
-            // ── Ensure required labels exist ──
+            //  Ensure required labels exist 
             const labelDefs = [
               { name: 'security',   color: 'e11d48', description: 'Security finding' },
               { name: 'critical',   color: 'b91c1c', description: 'Critical severity' },
@@ -392,7 +392,7 @@ jobs:
               }
             }
 
-            // ── Fetch ALL open security issues for dedup (paginated) ──
+            //  Fetch ALL open security issues for dedup (paginated) 
             const allOpen = await github.paginate(github.rest.issues.listForRepo, {
               owner, repo, state: 'open', labels: 'security', per_page: 100
             });
@@ -401,9 +401,8 @@ jobs:
             const issues = [];
             const footer = `\n---\n*DevSecOps pipeline — ${today} | [Run #${context.runId}](${runUrl})*`;
 
-            // ────────────────────────────────────
             //  1. TRIVY SCA → [DEPENDENCY] issues
-            // ────────────────────────────────────
+
             const scaPath = './reports/trivy-sca-results.json';
             if (fs.existsSync(scaPath)) {
               try {
@@ -448,11 +447,10 @@ jobs:
               } catch (e) { console.log(`SCA parse error: ${e.message}`); }
             } else { console.log('No SCA results found'); }
 
-            // ────────────────────────────────────
             //  2. TRIVY IMAGE → [CONTAINER] issues
             //     Only for packages NOT already in SCA (avoids duplication).
             //     Deduplicates CVEs that appear at multiple paths in the image.
-            // ────────────────────────────────────
+            
             const scaPkgNames = new Set(issues.map(i => {
               const m = i.title.match(/\[DEPENDENCY\]\s+(.+?)\s+—/);
               return m ? m[1] : null;
@@ -506,9 +504,7 @@ jobs:
               } catch (e) { console.log(`Container parse error: ${e.message}`); }
             } else { console.log('No container results file found at ' + imgPath); }
 
-            // ────────────────────────────────────
             //  3. CODEQL SARIF → [CODE] issues
-            // ────────────────────────────────────
             const codeqlDir = './reports/codeql';
             if (fs.existsSync(codeqlDir)) {
               try {
@@ -586,10 +582,8 @@ jobs:
               } catch (e) { console.log(`CodeQL parse error: ${e.message}`); }
             } else { console.log('No CodeQL SARIF directory found'); }
 
-            // ────────────────────────────────────
             //  4. SECRETS → combined [SECRET] issue
             //     Gitleaks (SARIF) + detect-secrets (JSON)
-            // ────────────────────────────────────
             const secrets = [];
             const secretDedup = new Set();
 
@@ -658,10 +652,10 @@ jobs:
               issues.push({ title, body, labels: ['security', 'critical', 'secret'], severity: 'CRITICAL' });
             }
 
-            // ── Sort CRITICAL first, then HIGH ──
+            //  Sort CRITICAL first, then HIGH 
             issues.sort((a, b) => (a.severity === b.severity) ? 0 : a.severity === 'CRITICAL' ? -1 : 1);
 
-            // ── Create issues with dedup ──
+            //  Create issues with dedup 
             let created = 0, skipped = 0;
             for (const issue of issues) {
               if (existingTitles.has(issue.title)) { skipped++; continue; }
@@ -689,6 +683,6 @@ jobs:
               }
             }
 
-            console.log(`\n── Summary ──`);
+            console.log(`\n Summary `);
             console.log(`Created: ${created} | Skipped (existing): ${skipped}`);
             console.log(`Total findings across all scanners: ${issues.length}`);
