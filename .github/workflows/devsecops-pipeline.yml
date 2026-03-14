@@ -45,22 +45,22 @@ jobs:
           path: target/*.war
 
   # ──────────────────────────────────────────────
-  # JOB 2: Secrets Detection (Gitleaks)
-  #   - Incremental scan (last commit) on push
-  #   - Full file scan (--no-git) on PR to main/master
-  #   - For full git-history audit, use workflow_dispatch
+  # JOB 2: Secrets Detection (Gitleaks + detect-secrets)
+  #   Gitleaks  → provider-specific tokens + git-history
+  #   detect-secrets → generic passwords/keys via keyword + entropy
+  #   For full git-history audit, use workflow_dispatch
   #     with: gitleaks detect --log-opts=--all
   # ──────────────────────────────────────────────
   secrets-scan:
     name: Secrets Detection
     runs-on: ubuntu-latest
     needs: build
-    continue-on-error: true   # monitoring mode – never blocks pipeline
+    continue-on-error: true
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0      # full history needed for accurate scan
+          fetch-depth: 0
 
       - name: Run Gitleaks (full file scan)
         id: gitleaks-scan
@@ -73,7 +73,18 @@ jobs:
             -v \
             --exit-code=0 \
             --report-format=sarif \
-            --report-path=results.sarif
+            --report-path=gitleaks-results.sarif
+        continue-on-error: true
+
+      - name: Run detect-secrets (keyword + entropy analysis)
+        id: detect-secrets-scan
+        run: |
+          pip install detect-secrets
+          detect-secrets scan \
+            --exclude-files 'target/.*' \
+            --exclude-files '\.gitleaks\.toml' \
+            --exclude-files '\.secrets\.baseline' \
+            > detect-secrets-results.json
         continue-on-error: true
 
       - name: Upload Gitleaks report
@@ -81,7 +92,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gitleaks-report
-          path: results.sarif
+          path: gitleaks-results.sarif
+          if-no-files-found: ignore
+
+      - name: Upload detect-secrets report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-secrets-report
+          path: detect-secrets-results.json
           if-no-files-found: ignore
 
   # ──────────────────────────────────────────────
@@ -345,6 +364,13 @@ jobs:
           path: ./reports/gitleaks
         continue-on-error: true
 
+      - name: Download detect-secrets report
+        uses: actions/download-artifact@v4
+        with:
+          name: detect-secrets-report
+          path: ./reports/detect-secrets
+        continue-on-error: true
+
       - name: Create categorized security issues
         uses: actions/github-script@v7
         with:
@@ -574,49 +600,76 @@ jobs:
             } else { console.log('No CodeQL SARIF directory found'); }
 
             // ────────────────────────────────────
-            //  4. GITLEAKS SARIF → [SECRET] issue
+            //  4. SECRETS → combined [SECRET] issue
+            //     Gitleaks (SARIF) + detect-secrets (JSON)
             // ────────────────────────────────────
+            const secrets = [];
+            const secretDedup = new Set();
+
+            // 4a. Gitleaks SARIF
             const glDir = './reports/gitleaks';
             if (fs.existsSync(glDir)) {
               try {
                 const allGlFiles = fs.readdirSync(glDir);
                 console.log(`Gitleaks: directory contains: ${allGlFiles.join(', ') || '(empty)'}`);
-                const files = allGlFiles.filter(f => f.endsWith('.sarif'));
-                const secrets = [];
-                for (const sf of files) {
+                for (const sf of allGlFiles.filter(f => f.endsWith('.sarif'))) {
                   const sarif = JSON.parse(fs.readFileSync(path.join(glDir, sf), 'utf8'));
                   for (const run of (sarif.runs || [])) {
                     for (const result of (run.results || [])) {
                       const loc = result.locations?.[0]?.physicalLocation;
-                      secrets.push({
-                        type: result.ruleId || 'unknown',
-                        file: loc?.artifactLocation?.uri || 'unknown',
-                        line: loc?.region?.startLine || '?'
-                      });
+                      const file = loc?.artifactLocation?.uri || 'unknown';
+                      const line = loc?.region?.startLine || '?';
+                      const key = `${file}:${line}`;
+                      if (!secretDedup.has(key)) {
+                        secretDedup.add(key);
+                        secrets.push({ scanner: 'Gitleaks', type: result.ruleId || 'unknown', file, line });
+                      }
                     }
                   }
                 }
-                if (secrets.length > 0) {
-                  const title = `[CRITICAL][SECRET] ${secrets.length} exposed secret${secrets.length===1?'':'s'} detected`;
-                  const rows = secrets.map(s => `| \`${s.type}\` | \`${s.file}\` | ${s.line} |`).join('\n');
-                  const body = [
-                    '## 🔴 Exposed Secrets Detected', '',
-                    `Gitleaks found **${secrets.length}** potential secret(s) in the repository.`,
-                    '', '### Findings', '',
-                    '| Secret Type | File | Line |',
-                    '|-------------|------|------|',
-                    rows, '',
-                    '### Remediation',
-                    '1. **Rotate** all exposed credentials immediately',
-                    '2. **Remove** secrets from the codebase and git history',
-                    '3. **Use** environment variables or a secrets manager instead',
-                    '4. Add false positives to `.gitleaks.toml` allowlist',
-                    footer
-                  ].join('\n');
-                  issues.push({ title, body, labels: ['security', 'critical', 'secret'], severity: 'CRITICAL' });
-                }
               } catch (e) { console.log(`Gitleaks parse error: ${e.message}`); }
-            } else { console.log('No Gitleaks report directory found at ' + glDir); }
+            } else { console.log('No Gitleaks report directory found'); }
+
+            // 4b. detect-secrets JSON
+            const dsDir = './reports/detect-secrets';
+            if (fs.existsSync(dsDir)) {
+              try {
+                const dsFiles = fs.readdirSync(dsDir).filter(f => f.endsWith('.json'));
+                console.log(`detect-secrets: directory contains: ${fs.readdirSync(dsDir).join(', ') || '(empty)'}`);
+                for (const df of dsFiles) {
+                  const report = JSON.parse(fs.readFileSync(path.join(dsDir, df), 'utf8'));
+                  for (const [file, findings] of Object.entries(report.results || {})) {
+                    for (const finding of findings) {
+                      const key = `${file}:${finding.line_number}`;
+                      if (!secretDedup.has(key)) {
+                        secretDedup.add(key);
+                        secrets.push({ scanner: 'detect-secrets', type: finding.type || 'unknown', file, line: finding.line_number });
+                      }
+                    }
+                  }
+                }
+              } catch (e) { console.log(`detect-secrets parse error: ${e.message}`); }
+            } else { console.log('No detect-secrets report directory found'); }
+
+            if (secrets.length > 0) {
+              const title = `[CRITICAL][SECRET] ${secrets.length} exposed secret${secrets.length===1?'':'s'} detected`;
+              const rows = secrets.map(s => `| \`${s.type}\` | \`${s.file}\` | ${s.line} | ${s.scanner} |`).join('\n');
+              const body = [
+                '## 🔴 Exposed Secrets Detected', '',
+                `**${secrets.length}** potential secret(s) found by Gitleaks + detect-secrets.`,
+                '', '### Findings', '',
+                '| Secret Type | File | Line | Scanner |',
+                '|-------------|------|------|---------|',
+                rows, '',
+                '### Remediation',
+                '1. **Rotate** all exposed credentials immediately',
+                '2. **Remove** secrets from the codebase and git history',
+                '3. **Use** environment variables or a secrets manager instead',
+                '4. Add false positives to `.gitleaks.toml` allowlist or `.secrets.baseline`',
+                footer
+              ].join('\n');
+              issues.push({ title, body, labels: ['security', 'critical', 'secret'], severity: 'CRITICAL' });
+            }
 
             // ── Sort CRITICAL first, then HIGH ──
             issues.sort((a, b) => (a.severity === b.severity) ? 0 : a.severity === 'CRITICAL' ? -1 : 1);

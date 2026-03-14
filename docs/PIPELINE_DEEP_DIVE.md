@@ -28,7 +28,8 @@ Traditional software development treats security as a gate at the end — a pene
 Traditional:   Code → Build → Test → ............... → Security Audit → Deploy
 DevSecOps:     Code → [Secrets] → Build → [SAST] → [SCA] → [Container Scan] → Deploy
                  ↑                   ↑        ↑         ↑           ↑
-              Gitleaks           CodeQL    Trivy SCA  Trivy Image   (DAST would go here)
+         Gitleaks +          CodeQL    Trivy SCA  Trivy Image   (DAST would go here)
+         detect-secrets
 ```
 
 The goal is **fast feedback** — a developer sees a SQL injection finding in the pull request, not three months later in a pentest report. The pipeline automates what would otherwise require manual security reviews.
@@ -39,7 +40,7 @@ Each security tool in the pipeline addresses a different attack surface:
 
 | Tool | What it answers | Analogy |
 |------|----------------|---------|
-| **Gitleaks** | "Did someone commit a password?" | Checking your pockets before leaving the house |
+| **Gitleaks + detect-secrets** | "Did someone commit a password?" | Checking your pockets before leaving the house |
 | **CodeQL** | "Does my code have exploitable patterns?" | A code reviewer who never gets tired |
 | **Trivy SCA** | "Are my dependencies vulnerable?" | Checking if your building materials have recalls |
 | **Trivy Container** | "Is the deployed artifact actually safe?" | Inspecting the finished building, not just the blueprints |
@@ -134,40 +135,47 @@ build:
 
 ---
 
-### Job 2: Secrets Detection (Gitleaks)
+### Job 2: Secrets Detection (Gitleaks + detect-secrets)
 
 ```yaml
 secrets-scan:
   needs: build
   continue-on-error: true
   steps:
-    - Run Gitleaks (incremental – push)     # only on push events
-    - Run Gitleaks (full file scan – PR)     # only on pull_request events
-    - Upload Gitleaks report
+    - Run Gitleaks (full file scan, --no-git)
+    - Run detect-secrets (keyword + entropy analysis)
+    - Upload Gitleaks report (SARIF)
+    - Upload detect-secrets report (JSON)
 ```
 
-**What it does:** Scans the repository for accidentally committed secrets — API keys, passwords, tokens, private keys.
+**What it does:** Scans the repository for accidentally committed secrets — API keys, passwords, tokens, private keys — using two complementary tools.
+
+**Why two scanners?** No single open-source secrets scanner covers all secret types well. After testing Gitleaks, TruffleHog, Semgrep Secrets, detect-secrets, and Whispers (archived), the conclusion is:
+
+| Tool | Provider tokens (AWS, GitHub, etc.) | Generic `password=value` in configs | Custom rules needed? |
+|------|-------------------------------------|-------------------------------------|----------------------|
+| **Gitleaks** | Excellent (~150 rules) | No | Yes (custom `.toml`) |
+| **detect-secrets** | Limited | Excellent (KeywordDetector + entropy) | No |
+| Combined | Excellent | Excellent | **No** |
 
 **How Gitleaks works:**
-1. Gitleaks has ~150 built-in regex rules targeting specific secret formats (AWS access keys, GitHub tokens, Slack webhooks, RSA private keys, etc.)
-2. It scans either git diffs (history mode) or files on disk (no-git mode)
-3. Matches are reported in SARIF format with the secret type, file location, and line number
+1. ~150 built-in regex rules targeting specific secret formats (AWS access keys with `AKIA` prefix, GitHub tokens with `ghp_`, Slack webhooks, RSA private keys, etc.)
+2. Scans files on disk in `--no-git` mode (bypasses git history, catches any secret currently present)
+3. Outputs SARIF format
 
-**The two-tier scanning strategy:**
+**How detect-secrets works:**
+1. **KeywordDetector**: flags lines where keywords like `password`, `secret`, `token`, `api_key` appear in assignment context (e.g., `mysql.password=...`, `MYSQL_PASSWORD: ...`)
+2. **HexHighEntropyString / Base64HighEntropyString**: flags values with high randomness that look like real credentials
+3. Additional plugins for AWS keys, GitHub tokens, JWT, private keys, etc.
+4. Outputs JSON with file paths, line numbers, and finding types
 
-| Event | Scan mode | Why |
-|-------|-----------|-----|
-| `push` | Incremental (`gitleaks-action@v2` default) | Only checks the new commit. Fast. Catches secrets introduced by this push. |
-| `pull_request` | Full file scan (`--no-git`) | Scans all files on disk. Catches any secret in the current codebase, regardless of when it was committed. Acts as a merge gate. |
+**Deduplication:** Both scanners' findings are merged in the issue creation step, deduplicated by `file:line` to avoid reporting the same secret twice.
 
-**Why not always do a full scan?**
-- For repos with long history (thousands of commits), scanning every diff is slow
-- `--no-git` is fast (reads files once) and catches everything currently in the repo
-- For finding secrets that were committed and then deleted (still in git history), a separate audit workflow with `--log-opts=--all` is recommended
+**Scanning strategy:**
+- **Default (push/PR):** Gitleaks `--no-git` + detect-secrets scan all files on disk. Fast and catches any secret currently in the codebase.
+- **Full git-history audit:** Run `gitleaks detect --log-opts=--all` via `workflow_dispatch` to find secrets that were committed and later deleted (still in history, still need rotation).
 
-**`continue-on-error: true`** — This means secrets detection runs in **monitoring mode**. Even if secrets are found, the pipeline continues. This is a deliberate choice: in early adoption of DevSecOps, blocking the pipeline on every finding creates developer friction and reduces adoption. Over time, once the backlog of findings is cleared, you'd change this to `continue-on-error: false` (blocking mode).
-
-**Key limitation:** Default Gitleaks rules detect high-confidence patterns (tokens with distinctive prefixes like `ghp_`, `AKIA`, `sk-live-`). Generic passwords in config files (e.g., `mysql.password=abc123`) may not match any rule without custom configuration in a `.gitleaks.toml` file.
+**`continue-on-error: true`** — Secrets detection runs in **monitoring mode**. Even if secrets are found, the pipeline continues. This is a deliberate choice for early DevSecOps adoption: blocking on every finding creates friction. Once the backlog is cleared, switch to `continue-on-error: false` (blocking mode).
 
 ---
 
@@ -399,7 +407,7 @@ create-security-issues:
 | Trivy SCA | `[DEPENDENCY]` | `security`, `dependency`, severity | One issue per vulnerable package (groups all CVEs) |
 | Trivy Image | `[CONTAINER]` | `security`, `container`, severity | One issue per vulnerable package |
 | CodeQL | `[CODE]` | `security`, `code`, severity | One issue per rule (groups all locations) |
-| Gitleaks | `[SECRET]` | `security`, `secret`, `critical` | One issue for all secrets combined |
+| Gitleaks + detect-secrets | `[SECRET]` | `security`, `secret`, `critical` | One combined issue, deduplicated by file:line |
 
 **Deduplication strategy:**
 ```javascript
@@ -468,7 +476,7 @@ Understanding where each tool fits in the broader security testing landscape:
 
 | Approach | Finds | Misses | Speed |
 |----------|-------|--------|-------|
-| **Secrets Detection** | Committed credentials, API keys, private keys | Generic passwords without distinctive patterns | Seconds |
+| **Secrets Detection** | Committed credentials, API keys, private keys, generic passwords in config files (via dual-scanner approach) | Secrets in binary files, encrypted/obfuscated values | Seconds |
 | **SAST** | Injection flaws, unsafe crypto, data exposure — in your code | Logic flaws, missing controls (CSRF, IDOR), cross-language flows | Minutes |
 | **SCA** | Known CVEs in declared dependencies | Zero-day vulnerabilities, vulnerabilities in undeclared/transitive dependencies not in DB | Seconds |
 | **Container Scan** | OS and library vulnerabilities in the deployed image | Application-level vulnerabilities (those need SAST/DAST) | Seconds-Minutes |
@@ -600,7 +608,7 @@ These labels allow developers to filter and prioritize:
 | **No blocking gate** | All scans are `continue-on-error: true` | Block on CRITICAL findings | Set `exit-code: '1'` for CRITICAL severity in Trivy; remove `continue-on-error` once backlog is cleared |
 | **No SLA tracking** | Issues are created but not time-tracked | Enforce fix SLAs | Add due dates: CRITICAL = 7 days, HIGH = 30 days |
 | **No auto-close** | Fixed vulnerabilities stay open | Auto-close when fixed | Add a job that closes issues when the vulnerability no longer appears |
-| **Gitleaks custom rules** | Default rules only | Customize for the project | Add `.gitleaks.toml` with rules for `*.password=` patterns in config files |
+| **Secrets coverage** | ~~Default Gitleaks rules only~~ **Resolved** | Catch generic passwords in config files | Added **detect-secrets** as a complementary scanner — its KeywordDetector + entropy plugins catch `password=value` patterns that Gitleaks intentionally skips |
 | **No IaC scanning** | Dockerfile not scanned for misconfigurations | Scan Dockerfiles and compose files | Add `trivy config .` or Hadolint for Dockerfile best practices |
 | **No SBOM generation** | Dependencies listed only in scan results | Generate and publish an SBOM | Add `trivy sbom --format cyclonedx` for supply chain transparency |
 | **Tests skipped** | `-DskipTests` in build | Run tests as part of CI | Add a test stage (or at least don't skip in production pipeline) |
@@ -659,27 +667,27 @@ For maximum accuracy, you could add a step that runs `mvn dependency:tree -Doutp
 
 ### Applied to DVJA's known vulnerabilities
 
-| Vulnerability | Gitleaks | CodeQL | Trivy SCA | Trivy Container | DAST (not in pipeline) |
-|--------------|----------|--------|-----------|-----------------|----------------------|
-| **SQL Injection** (A1) | | **YES** | | | YES |
-| **Command Injection** (A1) | | **YES** | | | YES |
-| **XSS — Reflected** (A3) | | Partial | | | **YES** |
-| **XSS — Stored** (A3) | | Partial | | | **YES** |
-| **Broken Auth** — MD5 reset token (A2) | | | | | **YES** |
-| **Broken Auth** — MD5 password hashing (A2) | | Partial | | | |
-| **IDOR** (A4) | | | | | **YES** |
-| **Security Misconfiguration** — devMode (A5) | | **YES** (with XML indexing) | | | |
-| **Sensitive Data in Logs** (A6) | | **YES** | | | |
-| **Admin Bypass via Cookie** (A7) | | | | | **YES** |
-| **CSRF** (A8) | | | | | **YES** |
-| **Struts2 CVE-2017-5638** (A9) | | | **YES** | **YES** | YES |
-| **Log4Shell CVE-2021-44228** | | | **YES** | **YES** | YES |
-| **Open Redirect** (A10) | | | | | **YES** |
-| **Hardcoded credentials** in config.properties | **Possible** | **YES** (with .properties indexing) | | | |
-| **Hardcoded credentials** in docker-compose.yml | **YES** | | | | |
-| **Log Injection** (CWE-117) | | **YES** | | | |
+| Vulnerability | Gitleaks | detect-secrets | CodeQL | Trivy SCA | Trivy Container | DAST (not in pipeline) |
+|--------------|----------|---------------|--------|-----------|-----------------|----------------------|
+| **SQL Injection** (A1) | | | **YES** | | | YES |
+| **Command Injection** (A1) | | | **YES** | | | YES |
+| **XSS — Reflected** (A3) | | | Partial | | | **YES** |
+| **XSS — Stored** (A3) | | | Partial | | | **YES** |
+| **Broken Auth** — MD5 reset token (A2) | | | | | | **YES** |
+| **Broken Auth** — MD5 password hashing (A2) | | | Partial | | | |
+| **IDOR** (A4) | | | | | | **YES** |
+| **Security Misconfiguration** — devMode (A5) | | | **YES** (with XML indexing) | | | |
+| **Sensitive Data in Logs** (A6) | | | **YES** | | | |
+| **Admin Bypass via Cookie** (A7) | | | | | | **YES** |
+| **CSRF** (A8) | | | | | | **YES** |
+| **Struts2 CVE-2017-5638** (A9) | | | | **YES** | **YES** | YES |
+| **Log4Shell CVE-2021-44228** | | | | **YES** | **YES** | YES |
+| **Open Redirect** (A10) | | | | | | **YES** |
+| **Hardcoded credentials** in config.properties | | **YES** (KeywordDetector) | **YES** (with .properties indexing) | | | |
+| **Hardcoded credentials** in docker-compose.yml | | **YES** (KeywordDetector + HexHighEntropy) | | | | |
+| **Log Injection** (CWE-117) | | | **YES** | | | |
 
-**Key takeaway:** No single tool catches everything. The value of a DevSecOps pipeline is the **combination** of multiple tools, each covering different blind spots. Even with all four tools in this pipeline, DAST and manual review are still needed for a complete security posture.
+**Key takeaway:** No single tool catches everything. The value of a DevSecOps pipeline is the **combination** of multiple tools, each covering different blind spots. The dual-scanner approach for secrets (Gitleaks for provider tokens + detect-secrets for generic passwords) is a good example: neither tool alone covers all secret types, but together they provide comprehensive coverage. Even with all five tools in this pipeline, DAST and manual review are still needed for a complete security posture.
 
 ---
 

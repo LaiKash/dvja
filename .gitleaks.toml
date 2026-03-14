@@ -1,64 +1,14 @@
-# Custom Gitleaks rules for DVJA
-# Extends the default ruleset with patterns for generic credentials
-# commonly found in Java/Spring applications and Docker configurations.
+# Gitleaks configuration for DVJA
+#
+# Generic password/keyword detection is handled by detect-secrets
+# (KeywordDetector + HexHighEntropyString plugins).
+# Gitleaks focuses on provider-specific tokens using its default ruleset.
 
 title = "DVJA Gitleaks Configuration"
 
-# Exclude build output and IDE files
 [allowlist]
 paths = [
   '''target/''',
   '''\.idea/''',
   '''node_modules/'''
 ]
-
-# Rule 1: Password assignments in .properties files
-# Matches: mysql.password=xxx, db.password=xxx, etc.
-# Requires the value to look like a real credential (hex, base64, or long string)
-[[rules]]
-id = "properties-password"
-description = "Hardcoded password in properties file"
-regex = '''(?i)(password|passwd|pwd)\s*=\s*([A-Za-z0-9/+=!@#$%^&*]{8,})'''
-path = '''\.properties$'''
-keywords = ["password", "passwd", "pwd"]
-
-[rules.allowlist]
-regexTarget = "match"
-regexes = [
-  '''\$\{.*\}''',
-  '''getPassword|setPassword|passwordConfirmation''',
-  '''(?i)password\s*=\s*(Password|Contrase)'''
-]
-
-# Rule 2: MySQL / DB credentials in Docker Compose or env files
-[[rules]]
-id = "docker-compose-password"
-description = "Hardcoded password in Docker Compose or environment file"
-regex = '''(?i)(MYSQL_PASSWORD|MYSQL_ROOT_PASSWORD|DB_PASSWORD|DATABASE_PASSWORD|POSTGRES_PASSWORD)\s*[:=]\s*['"]?([^'"$\s]{8,})'''
-path = '''(docker-compose\.ya?ml|\.env|Dockerfile)$'''
-keywords = ["MYSQL_PASSWORD", "MYSQL_ROOT_PASSWORD", "DB_PASSWORD", "DATABASE_PASSWORD", "POSTGRES_PASSWORD"]
-
-# Rule 3: Generic secret assignments in YAML
-# Catches password: value patterns in any YAML config
-[[rules]]
-id = "yaml-password"
-description = "Hardcoded password in YAML configuration"
-regex = '''(?i)(password|secret|token|api_key|apikey)\s*:\s*['"]?([A-Za-z0-9/+=]{8,})['"]?'''
-path = '''\.ya?ml$'''
-entropy = 3.0
-keywords = ["password", "secret", "token", "api_key", "apikey"]
-
-[rules.allowlist]
-regexTarget = "match"
-regexes = [
-  '''\$\{\{.*\}\}''',
-  '''\$\{.*\}''',
-  '''secrets\.'''
-]
-
-# Rule 4: Connection strings with embedded credentials
-[[rules]]
-id = "connection-string"
-description = "Database connection string with embedded password"
-regex = '''(?i)(jdbc|mysql|postgres|mongodb|redis):\/\/[^:]+:([^@\s]{8,})@'''
-keywords = ["jdbc", "mysql", "postgres", "mongodb", "redis"]

